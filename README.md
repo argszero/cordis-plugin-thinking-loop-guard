@@ -25,13 +25,16 @@ turn never ends until the user aborts it. See
 
 ## How it works
 
-This plugin is a **community-side fix** that needs no harness patch. It subscribes
-to the public `agent/assistant-stream` event (scoped emit) and tallies the
-`StreamChunk` composition of each attempt:
+This plugin is a **community-side fix** that needs no harness patch. It observes
+the public `llm/stream` waterfall (present on **dsh 0.1.2-rc.1 and 0.1.5-alpha.1**)
+and tallies the `StreamChunk` composition of each loop-built model call. The live
+`Agent` is reached from the request's `sessionId` via `ctx.agents.get(...)`,
+so the guard works on the widely-installed 0.1.2-rc.1 as well as current master
+(no dependency on the 0.1.5-alpha.1-only `agent/assistant-stream` seam).
 
 - a chunk of type `text-delta` or `tool-call-delta` **resets** the counter — this
-  step produced output, so it is not a thinking loop;
-- a step that is **only** `reasoning-delta`, and at least `minReasoningChars`
+  call produced output, so it is not a thinking loop;
+- a call that is **only** `reasoning-delta`, and at least `minReasoningChars`
   long, counts toward `maxThinkingSteps`.
 
 When the threshold is crossed (or the reasoning text shows an unambiguous
@@ -66,7 +69,7 @@ interface Config {
   maxThinkingSteps?: number
   /** Minimum reasoning text in one step before it counts. Default 2048 chars. */
   minReasoningChars?: number
-  /** Longest repeated token / total tokens at which the step is flagged. Default 0.5. */
+  /** Repeated-gram coverage of the reasoning text at which the call is flagged. Language-agnostic (handles CJK, no whitespace). Default 0.5. */
   repeatRatio?: number
   /** Action on the threshold: 'warn' | 'steer' (default) | 'cancel'. */
   escalate?: 'warn' | 'steer' | 'cancel'
@@ -82,8 +85,19 @@ interface Config {
   any real output is ignored.
 - Per-`Agent` state is kept in a `WeakMap`, so a disposed agent is collected and
   its counters dropped.
-- The low-entropy check is a cheap heuristic (longest repeated whitespace token
-  over total tokens); it runs only once a step is already long, so cost is bound.
+- The low-entropy check is a cheap O(n) heuristic (repeated fixed-length gram
+  coverage; language-agnostic, so it works for CJK reasoning with no
+  whitespace); it runs only once a call is already long, so cost is bound.
+
+## Compatibility
+
+- **dsh 0.1.2-rc.1** (the widely-installed npm release): works — `llm/stream`,
+  `StreamChunk`, `GenerateOptions.sessionId`, `ctx.agents.get`, and
+  `agent.steer/cancel/inject` are all present.
+- **dsh 0.1.5-alpha.1**: works — same `llm/stream` seam. The newer
+  `agent/assistant-stream` event is NOT required; the guard does not depend on it.
+- The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm` `>=0.1.2`
+  (declared as peer dependencies).
 
 ## License
 

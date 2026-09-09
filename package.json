@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: detects reasoning-only degenerate steps (no text, no tool call) via the agent/assistant-stream event and escalates warn -> steer -> cancel to break the loop.",
-  "version": "0.1.0",
+  "description": "Thinking-loop guard for dsh: detects reasoning-only degenerate calls (no text, no tool call) via the llm/stream waterfall and escalates warn -> steer -> cancel to break the loop. Compatible with dsh 0.1.2-rc.1 and 0.1.5-alpha.1.",
+  "version": "0.1.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -36,11 +36,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": ">=0.1.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.2"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-agent": "^0.1.5-alpha.1",
-    "@deepseek-ai/dsh-llm": "^0.1.5-alpha.1",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
