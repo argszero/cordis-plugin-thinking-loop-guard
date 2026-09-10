@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: detects reasoning-only degenerate calls (no text, no tool call) via the llm/stream waterfall and escalates warn -> steer -> cancel to break the loop. Compatible with dsh 0.1.2-rc.1 and 0.1.5-alpha.1.",
-  "version": "0.1.3",
+  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a thinking loop. Detects three shapes: reasoning-only calls (no text/tool output), restated-material calls (a step repeating most of the previous step's reasoning while still emitting text), and self-repeating low-entropy reasoning. Reactions (warn/steer/cancel) re-fire up to maxFires instead of latching. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
+  "version": "0.1.4",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

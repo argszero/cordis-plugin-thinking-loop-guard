@@ -1,9 +1,19 @@
 # @argszero/cordis-plugin-thinking-loop-guard
 
 Thinking-loop guard for the DeepSeek Harness (`dsh`). Detects an agent that
-degrades into a **pure-thinking loop** — a step that emits only `reasoning-delta`
-chunks, with **zero `text-delta` and zero `tool-call-delta`** — and reacts to break
-the loop before it burns tokens until a human manually aborts the turn.
+degrades into a **thinking loop** and reacts to break it before it burns tokens
+until a human manually aborts the turn.
+
+A "thinking loop" is one of three shapes, all of which a long-context model under
+high reasoning effort can settle into:
+
+1. **reasoning-only calls** — a step that emits only `reasoning-delta` chunks, with
+   zero `text-delta` and zero `tool-call-delta`;
+2. **restated-material calls** — a step that repeats most of the previous step's
+   reasoning material (the same stalled conclusion re-derived in new words) while
+   also emitting some text, so it *looks* like progress;
+3. **self-repeating reasoning** — a single step whose own text is a low-entropy
+   repetition ("好。执行。好。执行。").
 
 ## The gap it closes
 
@@ -65,14 +75,18 @@ bundle patch:
 
 ```ts
 interface Config {
-  /** Consecutive reasoning-only steps (each ≥ minReasoningChars, no output) before reacting. Default 3. */
+  /** Consecutive stalled calls before reacting. Default 3. */
   maxThinkingSteps?: number
-  /** Minimum reasoning text in one step before it counts. Default 2048 chars. */
+  /** Minimum reasoning text in one call before it is judged at all. Default 2048 chars. */
   minReasoningChars?: number
-  /** Repeated-gram coverage of the reasoning text at which the call is flagged. Language-agnostic (handles CJK, no whitespace). Default 0.5. */
+  /** Intra-call repeated-gram coverage at which a call is flagged. Language-agnostic (handles CJK, no whitespace). Default 0.5. */
   repeatRatio?: number
-  /** Action on the threshold: 'warn' | 'steer' (default) | 'cancel'. */
+  /** Cross-call similarity: how much of the previous call's distinct reasoning must reappear before this call counts as a repetition. 0 disables. Default 0.8. */
+  similarityThreshold?: number
+  /** Action on a threshold crossing: 'warn' | 'steer' (default) | 'cancel'. */
   escalate?: 'warn' | 'steer' | 'cancel'
+  /** How many times one agent may be reacted to before the guard stops re-firing. Default 4. */
+  maxFires?: number
   /** Cancel cause when escalate is 'cancel'. Default 'thinking-loop'. */
   cancelCause?: string
 }
@@ -80,14 +94,32 @@ interface Config {
 
 ## Notes
 
-- The detector is deliberately **conservative**: a step must be long
-  (`minReasoningChars`) and reasoning-only; a short thinking burst or a step with
-  any real output is ignored.
 - Per-`Agent` state is kept in a `WeakMap`, so a disposed agent is collected and
   its counters dropped.
-- The low-entropy check is a cheap O(n) heuristic (repeated fixed-length gram
-  coverage; language-agnostic, so it works for CJK reasoning with no
-  whitespace); it runs only once a call is already long, so cost is bound.
+- **A reaction does not latch.** A single steer often does not break a strong loop,
+  so after firing the run counter resets and the guard re-fires after another
+  `maxThinkingSteps` stalled calls, up to `maxFires` times. Set `maxFires: 1` to
+  restore the old one-shot behaviour.
+- The cross-call signal is **containment of the smaller gram set**, not Jaccard
+  similarity. A stuck model usually restates the previous step's material and
+  appends another sentence; Jaccard would dilute that with the new material and
+  read the step as progress, while containment reports the repetition directly.
+- A call shorter than `minReasoningChars` is neither counted nor treated as
+  progress: a brief "ok, continuing" must not clear a run built from substantive
+  steps.
+- Both content checks are cheap O(n) heuristics over fixed-length grams
+  (language-agnostic, so CJK with no whitespace works) and run only once a call is
+  already long, so cost is bounded.
+
+## Version history
+
+| Version | Change |
+|---|---|
+| 0.1.0 | First release. Listened on `agent/assistant-stream` — **broken on 0.1.2-rc.1** (that event is 0.1.5-alpha.1-only). Issue #1. |
+| 0.1.1 | Switched to the `llm/stream` waterfall (present on both lines). |
+| 0.1.2 | Declared `inject = ['agents']` (without it `apply()` throws `cannot get property "agents" without inject` and every session fails to run). Fixed the base-less peer range. |
+| 0.1.3 | Fixed the peer range for the 0.1.5 line (`>=0.1.2-rc.1 <0.2.0` alone admits only `0.1.2-rc.1`). |
+| 0.1.4 | Fixed the **detector**: added cross-call restated-material detection, stopped resetting on incidental text output, and made reactions re-fire instead of latching. Issue #1's re-test on 0.1.2-rc.1 showed the loop recurring with 0.1.3 loaded and firing. |
 
 ## Compatibility
 
