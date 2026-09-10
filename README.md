@@ -96,8 +96,27 @@ interface Config {
   `agent.steer/cancel/inject` are all present.
 - **dsh 0.1.5-alpha.1**: works — same `llm/stream` seam. The newer
   `agent/assistant-stream` event is NOT required; the guard does not depend on it.
-- The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm` `>=0.1.2`
-  (declared as peer dependencies).
+- The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm`
+  `>=0.1.2-rc.1 <0.2.0` (declared as peer dependencies).
+
+### Why the peer range names a prerelease
+
+Every dsh release published today is a prerelease (`0.1.2-rc.1`,
+`0.1.5-alpha.1`, …). Under semver a range only admits prerelease versions that
+share the *same* `major.minor.patch` tuple, so `>=0.1.2` matches **nothing** —
+`0.1.2-rc.1` is lower than `0.1.2`, and the higher prereleases are excluded by
+the tuple rule. v0.1.1 shipped `>=0.1.2` and therefore could not be installed at
+all (`ETARGET: No matching version found for @deepseek-ai/dsh-agent@>=0.1.2`).
+`>=0.1.2-rc.1 <0.2.0` is the correct, prerelease-aware range.
+
+### Why `inject` is required
+
+The plugin resolves the live Agent through `ctx.agents.get(sessionId)`. Cordis
+throws `cannot get property "agents" without inject` for any service read the
+fiber did not declare, so the module exports `inject = ['agents']`. This is a
+**runtime** guard — TypeScript compiles `ctx.agents` fine whether or not it is
+declared, which is how v0.1.1 shipped crashing on activation (#1). If you fork
+this plugin and add another `ctx.<service>` read, declare it in `inject` too.
 
 ## License
 

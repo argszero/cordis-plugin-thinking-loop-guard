@@ -95,6 +95,22 @@ export const Config: z<Config> = z.object({
 
 export const name = 'thinking-loop-guard'
 
+/**
+ * Cordis services this plugin resolves off the Context.
+ *
+ * Declaring `agents` is REQUIRED, not documentation: Cordis's context proxy
+ * throws `cannot get property "agents" without inject` for any service read
+ * that the fiber did not declare (vendor/cordis/src/reflect.ts, the
+ * `waterfall('internal/get', …)` guard). The plugin reaches the live Agent via
+ * `ctx.agents.get(options.sessionId)`, so without this line `apply()` throws on
+ * activation and every session in that deployment fails to run.
+ *
+ * TypeScript cannot catch this: `ctx.agents` type-checks as soon as
+ * `@deepseek-ai/dsh-agent` is in the type graph, because the guard is purely
+ * runtime. That is exactly how v0.1.1 shipped broken (issue #1).
+ */
+export const inject = ['agents']
+
 const PLUGIN_SOURCE = { kind: 'plugin', plugin: 'thinking-loop-guard' } as const
 
 function message(text: string, form: 'notice'): UserMessage {
