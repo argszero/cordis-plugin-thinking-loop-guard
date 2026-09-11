@@ -111,10 +111,43 @@ interface Config {
   (language-agnostic, so CJK with no whitespace works) and run only once a call is
   already long, so cost is bounded.
 
+## Analyzing a session offline (`tools/analyze-session.mjs`)
+
+When the guard fires — or when it *should* have fired and did not — the next
+question is what the model actually did. This tool replays a **session jsonl**
+through the **same `LoopDetector` the plugin runs**, so its verdict is the
+installed guard's verdict, not a second opinion from a re-implementation:
+
+```sh
+node node_modules/@argszero/cordis-plugin-thinking-loop-guard/tools/analyze-session.mjs \
+  ~/.dsh/sessions/<session>.jsonl
+```
+
+```text
+  #   turn/step   reasonChars  textChars  verdict             fired
+   1  0/0                  33          0  reasoning-only
+   2  0/1                  33          3  repeated-material   repeated-material
+
+stalled steps: 2/2  |  reactions: 1  |  steps that emitted text: 1
+```
+
+- Override the detector knobs to match your profile: `--similarity 0.6`,
+  `--threshold 2`, `--min-chars 512`, `--max-fires 4`. `--json` emits the raw
+  per-step records.
+- It reads **both** durable attempt formats: `assistant/chunk` (session format v1,
+  dsh ≤ 0.1.2-rc.1) and `assistant/attempt` (session format v2, dsh ≥ 0.1.5).
+  Those two names do not overlap, so a reader can only be format-specific — this
+  tool handles both.
+- Unparseable lines and unknown record types are skipped rather than guessed at,
+  so a future format addition degrades to "fewer steps observed", never a wrong
+  verdict.
+- Your session file never leaves your machine; the tool only reads it.
+
 ## Version history
 
 | Version | Change |
 |---|---|
+| 0.1.5 | Ships `tools/analyze-session.mjs`, an offline session analyzer that replays a session jsonl through the same detector (both durable attempt formats). Exposes `./tools/*` in `exports`. |
 | 0.1.0 | First release. Listened on `agent/assistant-stream` — **broken on 0.1.2-rc.1** (that event is 0.1.5-alpha.1-only). Issue #1. |
 | 0.1.1 | Switched to the `llm/stream` waterfall (present on both lines). |
 | 0.1.2 | Declared `inject = ['agents']` (without it `apply()` throws `cannot get property "agents" without inject` and every session fails to run). Fixed the base-less peer range. |

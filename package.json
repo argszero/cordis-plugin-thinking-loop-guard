@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a thinking loop. Detects three shapes: reasoning-only calls (no text/tool output), restated-material calls (a step repeating most of the previous step's reasoning while still emitting text), and self-repeating low-entropy reasoning. Reactions (warn/steer/cancel) re-fire up to maxFires instead of latching. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
-  "version": "0.1.4",
+  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a thinking loop. Detects three shapes: reasoning-only calls (no text/tool output), restated-material calls (a step repeating most of the previous step's reasoning while still emitting text), and self-repeating low-entropy reasoning. Reactions (warn/steer/cancel) re-fire up to maxFires instead of latching. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
+  "version": "0.1.5",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -11,11 +11,13 @@
       "default": "./lib/index.js"
     },
     "./src/*": "./src/*",
+    "./tools/*": "./tools/*",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
     "lib/types/**/*.d.ts",
+    "tools/analyze-session.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -52,7 +54,8 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "tsc",
-    "test": "node --test \"test/*.spec.mjs\""
+    "test": "node --test \"test/*.spec.mjs\"",
+    "analyze": "node tools/analyze-session.mjs"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-agent": {

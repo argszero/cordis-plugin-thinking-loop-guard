@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+/**
+ * Offline replay of the thinking-loop guard over a real dsh session file.
+ *
+ * Issue #1 (jilian-dsh) needs two answers that only their machine has:
+ * "did the recurring calls emit text?" and "how similar were the reasoning
+ * texts?". Both are answerable from a session jsonl without re-running the
+ * model — and the answer is trustworthy only if it is produced by the SAME
+ * decision rule the plugin runs, so this script reuses `LoopDetector` from the
+ * plugin rather than re-implementing the heuristic (a re-implementation would
+ * be a second source of truth, and the whole point is to report what the
+ * installed guard would have decided).
+ *
+ * Usage:
+ *   node tools/analyze-session.mjs <session.jsonl> [--similarity 0.8] [--threshold 3]
+ *                                [--min-chars 2048] [--max-fires 4] [--json]
+ *
+ * Reads both durable attempt formats:
+ *   - `assistant/chunk` (session format v1: dsh <= 0.1.2-rc.1) — one event per
+ *     stream chunk, grouped by (turn, step);
+ *   - `assistant/attempt` (session format v2: dsh >= 0.1.5) — one event per
+ *     attempt carrying the whole compacted `stream` record array.
+ *
+ * A "step" is one model call, i.e. one (turn, step) group. For each step it
+ * reports whether text/tool output was emitted and what the reasoning was, then
+ * feeds the same `StepObservation` the plugin feeds at runtime.
+ */
+import { readFileSync } from 'node:fs'
+import { LoopDetector } from '../lib/index.js'
+
+const DEFAULT_CONFIG = {
+  maxThinkingSteps: 3,
+  minReasoningChars: 2048,
+  repeatRatio: 0.5,
+  similarityThreshold: 0.8,
+  maxFires: 4,
+}
+
+function parseArgs(argv) {
+  const config = { ...DEFAULT_CONFIG }
+  let file
+  let asJson = false
+  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires' }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--json') { asJson = true; continue }
+    if (flags[arg] !== undefined) {
+      const value = Number(argv[++i])
+      if (!Number.isFinite(value)) throw new Error(`${arg} expects a number`)
+      config[flags[arg]] = value
+      continue
+    }
+    if (arg.startsWith('--')) throw new Error(`unknown flag ${arg}`)
+    file = arg
+  }
+  if (file === undefined) throw new Error('usage: node tools/analyze-session.mjs <session.jsonl> [--json]')
+  return { file, config, asJson }
+}
+
+/** True when a chunk is model-authored output (as opposed to reasoning). */
+function isOutputChunk(type) {
+  return type === 'text-delta' || type === 'tool-call-delta'
+}
+
+/** Pull the reasoning/text/tool deltas out of one raw chunk. */
+function readChunk(chunk) {
+  if (chunk === null || typeof chunk !== 'object') return undefined
+  const type = chunk.type
+  if (typeof type !== 'string') return undefined
+  if (type === 'reasoning-delta') return { type, text: String(chunk.text ?? '') }
+  if (type === 'text-delta') return { type, text: String(chunk.text ?? '') }
+  if (type === 'tool-call-delta') return { type, text: String(chunk.argumentsDelta ?? '') }
+  return { type, text: '' }
+}
+
+/**
+ * Flatten one v1 `assistant/chunk` event into chunk-like deltas.
+ *
+ * The durable event carries `data.chunk` with the plugin-facing `StreamChunk`
+ * shape, so the mapping is direct.
+ */
+function deltasFromChunkEvent(event) {
+  const chunk = event?.data?.chunk
+  const delta = readChunk(chunk)
+  return delta === undefined ? [] : [delta]
+}
+
+/**
+ * Flatten one v2 `assistant/attempt` event's compacted stream into deltas.
+ *
+ * The durable stream is a compacted record array, not raw chunks:
+ *   - `{ type: 'chunk', time, chunk }` — one chunk, unchanged;
+ *   - `{ type: 'text-chunks' | 'reasoning-chunks' | 'tool-call-chunks', texts:
+ *      Array<[time, string]> }` — a run-length-compacted delta group.
+ * Unknown record types are ignored rather than guessed at, so a future format
+ * addition degrades to "fewer steps observed" instead of a wrong verdict.
+ */
+function deltasFromAttemptEvent(event) {
+  const stream = event?.data?.stream
+  if (!Array.isArray(stream)) return []
+  const out = []
+  for (const record of stream) {
+    if (record === null || typeof record !== 'object') continue
+    if (record.type === 'chunk') {
+      const delta = readChunk(record.chunk)
+      if (delta !== undefined) out.push(delta)
+      continue
+    }
+    const texts = record.texts
+    if (!Array.isArray(texts)) continue
+    const type = record.type === 'text-chunks'
+      ? 'text-delta'
+      : record.type === 'reasoning-chunks'
+        ? 'reasoning-delta'
+        : record.type === 'tool-call-chunks'
+          ? 'tool-call-delta'
+          : undefined
+    if (type === undefined) continue
+    for (const entry of texts) {
+      const text = Array.isArray(entry) ? entry[1] : entry
+      out.push({ type, text: String(text ?? '') })
+    }
+  }
+  return out
+}
+
+/** Group the file's events into per-model-call steps, in file order. */
+function readSteps(lines) {
+  const steps = []
+  const byCoordinate = new Map()
+  for (const line of lines) {
+    if (line.trim().length === 0) continue
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+    const type = event?.type
+    if (type !== 'assistant/chunk' && type !== 'assistant/attempt') continue
+    // v1 chunk events carry (turn, step) in data; v2 attempts are already one step.
+    const turn = event?.data?.turn
+    const step = event?.data?.step
+    const key = `${turn}/${step}`
+    let group = byCoordinate.get(key)
+    if (group === undefined) {
+      group = { turn, step, reasoning: '', text: '', hasOutput: false }
+      byCoordinate.set(key, group)
+      steps.push(group)
+    }
+    const deltas = type === 'assistant/chunk' ? deltasFromChunkEvent(event) : deltasFromAttemptEvent(event)
+    for (const delta of deltas) {
+      if (delta.type === 'reasoning-delta') group.reasoning += delta.text
+      else if (isOutputChunk(delta.type)) {
+        group.hasOutput = true
+        group.text += delta.text
+      }
+    }
+  }
+  return steps
+}
+
+const { file, config, asJson } = parseArgs(process.argv.slice(2))
+const lines = readFileSync(file, 'utf8').split('\n')
+const steps = readSteps(lines)
+
+const detector = new LoopDetector({ pollMs: 0, graceMs: 0, escalate: 'steer', ...config })
+const report = []
+for (const [index, step] of steps.entries()) {
+  const reason = detector.observe({ hasOutput: step.hasOutput, reasoning: step.reasoning })
+  const fire = detector.takeFire()
+  report.push({
+    step: index + 1,
+    turn: step.turn,
+    call: step.step,
+    reasoningChars: step.reasoning.length,
+    textChars: step.text.length,
+    hasOutput: step.hasOutput,
+    verdict: reason ?? 'progress',
+    fired: fire ?? null,
+  })
+}
+
+if (asJson) {
+  process.stdout.write(`${JSON.stringify({ file, config, steps: report }, null, 2)}\n`)
+} else {
+  console.log(`session: ${file}`)
+  console.log(`config:  ${JSON.stringify(config)}`)
+  console.log(`steps:   ${steps.length} model call(s)`)
+  console.log('')
+  console.log('  #   turn/step   reasonChars  textChars  verdict             fired')
+  for (const row of report) {
+    console.log(
+      `  ${String(row.step).padStart(2)}  ${String(row.turn)}/${String(row.call)}`.padEnd(20)
+      + `${String(row.reasoningChars).padStart(9)}  ${String(row.textChars).padStart(9)}  `
+      + `${row.verdict.padEnd(18)}  ${row.fired ?? ''}`,
+    )
+  }
+  const stalls = report.filter(r => r.verdict !== 'progress').length
+  const fires = report.filter(r => r.fired !== null).length
+  const withText = report.filter(r => r.hasOutput).length
+  console.log('')
+  console.log(`stalled steps: ${stalls}/${report.length}  |  reactions: ${fires}  |  steps that emitted text: ${withText}`)
+  if (report.length === 0) {
+    console.log('(no assistant steps found — is this a v1 `assistant/chunk` or v2 `assistant/attempt` session?)')
+  }
+}

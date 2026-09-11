@@ -1,0 +1,139 @@
+/**
+ * Fixture tests for the offline session analyzer (tools/analyze-session.mjs).
+ *
+ * The analyzer exists so issue #1's reporter can answer two questions from a
+ * session file instead of re-running the model. That is only trustworthy if it
+ * parses BOTH durable attempt formats and reproduces the detector's own verdict,
+ * so each format gets a fixture here:
+ *
+ *   - v1 `assistant/chunk` (dsh <= 0.1.2-rc.1) — one event per chunk;
+ *   - v2 `assistant/attempt` (dsh >= 0.1.5) — compacted `stream` records.
+ *
+ * Run through `node --test` so CI-less consumers cannot silently break the tool.
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ANALYZER = fileURLToPath(new URL('../tools/analyze-session.mjs', import.meta.url))
+const TOOL = fileURLToPath(new URL('../lib/index.js', import.meta.url))
+
+/** Long enough to clear the analyzer's `--min-chars 8` test override. */
+const STALLED = 'We must reconsider whether the retry budget is the true root cause of the failure here.'
+const FRESH = 'The socket closed after the peer wrote a partial frame, so the reader saw an incomplete message.'
+
+function writeSession(lines) {
+  const dir = mkdtempSync(join(tmpdir(), 'tlg-analyzer-'))
+  const file = join(dir, 'session.jsonl')
+  writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n') + '\n')
+  return file
+}
+
+function run(file, extra = []) {
+  const out = execFileSync(process.execPath, [ANALYZER, file, '--json', '--min-chars', '8', '--threshold', '2', ...extra], { encoding: 'utf8' })
+  return JSON.parse(out)
+}
+
+test('analyzer reads v1 assistant/chunk events and groups them by (turn, step)', () => {
+  const chunk = (turn, step, data) => ({ type: 'assistant/chunk', seq: 0, time: 0, data: { turn, step, chunk: data } })
+  const file = writeSession([
+    // step 1: reasoning only (no text) -> reasoning-only
+    chunk(0, 0, { type: 'reasoning-delta', index: 0, text: STALLED }),
+    chunk(0, 0, { type: 'finish', reason: 'stop' }),
+    // step 2: same reasoning again, but this time with text -> repeated-material
+    chunk(0, 1, { type: 'reasoning-delta', index: 0, text: STALLED }),
+    chunk(0, 1, { type: 'text-delta', index: 1, text: 'still thinking' }),
+    chunk(0, 1, { type: 'finish', reason: 'stop' }),
+    { type: 'user/message', seq: 0, time: 0, data: { message: { id: 'm1', role: 'user', content: [] }, turn: 0, step: 2 } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 2, 'two model calls')
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[0].hasOutput, false)
+  assert.equal(steps[1].hasOutput, true)
+  assert.equal(steps[1].verdict, 'repeated-material')
+  // threshold 2: the second stalled step fires
+  assert.equal(steps[1].fired, 'repeated-material')
+})
+
+test('analyzer reads v2 assistant/attempt events with compacted stream records', () => {
+  const attempt = (turn, step, stream) => ({ type: 'assistant/attempt', seq: 0, time: 0, data: { turn, step, stream } })
+  const file = writeSession([
+    attempt(0, 0, [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }]),
+    attempt(0, 1, [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+      { type: 'text-chunks', time0: 1, texts: [[1, 'still thinking']] },
+    ]),
+    attempt(0, 2, [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, FRESH]] },
+      { type: 'chunk', time: 1, chunk: { type: 'tool-call-delta', index: 0, id: 'c1', argumentsDelta: '{}' } },
+    ]),
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 3)
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[1].verdict, 'repeated-material')
+  // Fresh material with real output is progress and ends the run.
+  assert.equal(steps[2].verdict, 'progress')
+  assert.equal(steps[2].textChars, '{}'.length)
+})
+
+test('analyzer survives unrelated and malformed lines without losing the steps', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tlg-analyzer-'))
+  const file = join(dir, 'session.jsonl')
+  writeFileSync(file, [
+    '{"type":"turn/start","seq":0,"time":0,"data":{"turn":0}}',
+    'not json at all',
+    JSON.stringify({ type: 'assistant/attempt', seq: 1, time: 1, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } }),
+    '',
+    JSON.stringify({ type: 'turn/end', seq: 2, time: 2, data: { turn: 0 } }),
+  ].join('\n') + '\n')
+  const { steps } = run(file)
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].verdict, 'reasoning-only')
+})
+
+test('an unknown stream record type is skipped rather than guessed at', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'future-record-kind', texts: [[0, STALLED]] },
+      { type: 'reasoning-chunks', time0: 1, texts: [[1, STALLED]] },
+    ] } },
+    { type: 'assistant/attempt', seq: 1, time: 1, data: { turn: 0, step: 1, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+      { type: 'text-chunks', time0: 1, texts: [[1, 'text']] },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[1].verdict, 'repeated-material')
+})
+
+test('analyzer reports no steps for a session with no assistant events', () => {
+  const file = writeSession([{ type: 'turn/start', seq: 0, time: 0, data: { turn: 0 } }])
+  const { steps } = run(file)
+  assert.deepEqual(steps, [])
+})
+
+test('analyzer verdicts agree with the shipped LoopDetector for the same input', async () => {
+  const { LoopDetector } = await import(TOOL)
+  const config = { maxThinkingSteps: 2, minReasoningChars: 8, repeatRatio: 0.5, similarityThreshold: 0.8, maxFires: 4 }
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
+    { type: 'assistant/attempt', seq: 1, time: 1, data: { turn: 0, step: 1, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+      { type: 'text-chunks', time0: 1, texts: [[1, 'x']] },
+    ] } },
+  ])
+  const analyzed = run(file)
+  const detector = new LoopDetector(config)
+  const direct = [
+    detector.observe({ hasOutput: false, reasoning: STALLED }),
+    detector.observe({ hasOutput: true, reasoning: STALLED }),
+  ]
+  assert.deepEqual(analyzed.steps.map(s => s.verdict), direct.map(r => r ?? 'progress'))
+})
