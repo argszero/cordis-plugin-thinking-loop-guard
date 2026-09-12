@@ -14,7 +14,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,8 +26,31 @@ const TOOL = fileURLToPath(new URL('../lib/index.js', import.meta.url))
 const STALLED = 'We must reconsider whether the retry budget is the true root cause of the failure here.'
 const FRESH = 'The socket closed after the peer wrote a partial frame, so the reader saw an incomplete message.'
 
-function writeSession(lines) {
+/**
+ * Scratch directories created by this file, removed on process exit.
+ *
+ * `mkdtempSync` alone leaks one directory per call, and this suite calls it once
+ * per test — a full-suite run left 164 of them behind in the OS tempdir before
+ * this was added. `process.on('exit')` (not `after()`) is deliberate: it still
+ * runs when a test fails or the runner bails, which is exactly when the leak
+ * would otherwise accumulate unnoticed.
+ */
+const scratchDirs = []
+process.on('exit', () => {
+  for (const dir of scratchDirs) {
+    try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ }
+  }
+})
+
+/** Create a tracked scratch directory. Every temp dir MUST come from here. */
+function scratchDir() {
   const dir = mkdtempSync(join(tmpdir(), 'tlg-analyzer-'))
+  scratchDirs.push(dir)
+  return dir
+}
+
+function writeSession(lines) {
+  const dir = scratchDir()
   const file = join(dir, 'session.jsonl')
   writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n') + '\n')
   return file
@@ -83,7 +106,7 @@ test('analyzer reads v2 assistant/attempt events with compacted stream records',
 })
 
 test('analyzer survives unrelated and malformed lines without losing the steps', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tlg-analyzer-'))
+  const dir = scratchDir()
   const file = join(dir, 'session.jsonl')
   writeFileSync(file, [
     '{"type":"turn/start","seq":0,"time":0,"data":{"turn":0}}',
