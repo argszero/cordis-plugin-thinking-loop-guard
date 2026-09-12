@@ -24,9 +24,16 @@
  * A "step" is one model call, i.e. one (turn, step) group. For each step it
  * reports whether text/tool output was emitted and what the reasoning was, then
  * feeds the same `StepObservation` the plugin feeds at runtime.
+ *
+ * It also reports the **intra-call** shape (issue #2848): the trailing run of
+ * identical visible-output chunks inside one call, which is the only measure
+ * that describes a call repeating itself for minutes without ever ending. That
+ * shape is invisible to every per-call verdict on purpose — the call never
+ * completes — so it gets its own column. Pass `--max-repeated-text` to see
+ * whether the shipped breaker would have cut that call.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector } from '../lib/index.js'
+import { LoopDetector, countRepeatedText } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -34,13 +41,14 @@ const DEFAULT_CONFIG = {
   repeatRatio: 0.5,
   similarityThreshold: 0.8,
   maxFires: 4,
+  maxRepeatedText: 60,
 }
 
 function parseArgs(argv) {
   const config = { ...DEFAULT_CONFIG }
   let file
   let asJson = false
-  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires' }
+  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires', '--max-repeated-text': 'maxRepeatedText' }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--json') { asJson = true; continue }
@@ -140,7 +148,7 @@ function readSteps(lines) {
     const key = `${turn}/${step}`
     let group = byCoordinate.get(key)
     if (group === undefined) {
-      group = { turn, step, reasoning: '', text: '', hasOutput: false }
+      group = { turn, step, reasoning: '', text: '', texts: [], hasOutput: false }
       byCoordinate.set(key, group)
       steps.push(group)
     }
@@ -150,6 +158,9 @@ function readSteps(lines) {
       else if (isOutputChunk(delta.type)) {
         group.hasOutput = true
         group.text += delta.text
+        // Only text deltas participate in the intra-call breaker; tool-argument
+        // deltas are chunked by the provider's own tokenizer.
+        if (delta.type === 'text-delta') group.texts.push(delta.text)
       }
     }
   }
@@ -165,17 +176,25 @@ const report = []
 for (const [index, step] of steps.entries()) {
   const reason = detector.observe({ hasOutput: step.hasOutput, reasoning: step.reasoning })
   const fire = detector.takeFire()
+  const repeatRun = countRepeatedText(step.texts)
   report.push({
     step: index + 1,
     turn: step.turn,
     call: step.step,
     reasoningChars: step.reasoning.length,
     textChars: step.text.length,
+    textChunks: step.texts.length,
     hasOutput: step.hasOutput,
     verdict: reason ?? 'progress',
     fired: fire ?? null,
+    // The intra-call shape (issue #2848). `repeatedRun` is the trailing run of
+    // identical visible-output chunks; `wouldBreak` answers whether the shipped
+    // breaker would have ended this call mid-stream.
+    repeatedRun: repeatRun,
+    wouldBreak: config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText,
   })
 }
+const broken = report.filter(r => r.wouldBreak).length
 
 if (asJson) {
   process.stdout.write(`${JSON.stringify({ file, config, steps: report }, null, 2)}\n`)
@@ -184,12 +203,13 @@ if (asJson) {
   console.log(`config:  ${JSON.stringify(config)}`)
   console.log(`steps:   ${steps.length} model call(s)`)
   console.log('')
-  console.log('  #   turn/step   reasonChars  textChars  verdict             fired')
+  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  break')
   for (const row of report) {
     console.log(
       `  ${String(row.step).padStart(2)}  ${String(row.turn)}/${String(row.call)}`.padEnd(20)
       + `${String(row.reasoningChars).padStart(9)}  ${String(row.textChars).padStart(9)}  `
-      + `${row.verdict.padEnd(18)}  ${row.fired ?? ''}`,
+      + `${String(row.textChunks).padStart(6)}  ${row.verdict.padEnd(18)}  ${String(row.fired ?? '').padEnd(5)}  `
+      + `${String(row.repeatedRun).padStart(11)}  ${row.wouldBreak ? 'BREAK' : ''}`,
     )
   }
   const stalls = report.filter(r => r.verdict !== 'progress').length
@@ -197,6 +217,11 @@ if (asJson) {
   const withText = report.filter(r => r.hasOutput).length
   console.log('')
   console.log(`stalled steps: ${stalls}/${report.length}  |  reactions: ${fires}  |  steps that emitted text: ${withText}`)
+  console.log(`intra-call repetition: ${broken} call(s) would be cut mid-stream (maxRepeatedText = ${config.maxRepeatedText})`)
+  if (broken === 0 && report.some(r => r.repeatedRun > 1)) {
+    const worst = Math.max(...report.map(r => r.repeatedRun))
+    console.log(`  (the longest identical-chunk run seen was ${worst}; lower --max-repeated-text to cut such calls)`)
+  }
   if (report.length === 0) {
     console.log('(no assistant steps found — is this a v1 `assistant/chunk` or v2 `assistant/attempt` session?)')
   }

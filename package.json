@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a thinking loop. Detects three shapes: reasoning-only calls (no text/tool output), restated-material calls (a step repeating most of the previous step's reasoning while still emitting text), and self-repeating low-entropy reasoning. Reactions (warn/steer/cancel) re-fire up to maxFires instead of latching. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
-  "version": "0.1.5",
+  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects three per-call shapes (reasoning-only calls, restated-material calls, self-repeating low-entropy reasoning) and re-fires instead of latching; plus a mid-stream breaker (maxRepeatedText) that ends a single call repeating its visible output, which no post-call detector can reach. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
+  "version": "0.1.6",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -30,7 +30,10 @@
     "plugin",
     "guard",
     "thinking-loop",
-    "reasoning"
+    "reasoning",
+    "repetition",
+    "circuit-breaker",
+    "output-guard"
   ],
   "dsh": {
     "bundle": {

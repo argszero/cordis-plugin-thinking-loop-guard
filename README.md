@@ -59,6 +59,46 @@ low-entropy repetition, i.e. `repeatRatio`), it escalates:
 the live `Agent`. A listener can react but cannot veto/rewrite an in-flight step;
 steer and cancel are sufficient to break the loop.
 
+## Single-call repetition (`maxRepeatedText`)
+
+Everything above is judged **after a call ends** — which is structurally too late
+for one reported failure:
+
+> [discussion #2848](https://github.com/deepseek-ai/deepseek-harness/discussions/2848)
+> — with a very large context, one model call repeated a single sentence for
+> ~10 minutes: ~2825 identical text chunks, ~420,000 characters, until the user
+> aborted it manually. No `finish` chunk, no stop reason, no `assistant/message`.
+
+There is no call boundary to react at, so `maxRepeatedText` (default `60`) counts
+consecutive **identical trimmed `text-delta` payloads** and, on the Nth, ends the
+stream from inside the wrapper:
+
+- the pending upstream deltas are abandoned (they are never flushed into the log);
+- a terminal `finish` chunk with a `REPETITIVE_OUTPUT` failure is yielded, which
+  fails the step through the loop's normal error path and reaches the
+  `agent/request-error` waterfall, where a retry policy can act on the code;
+- a steering correction is queued first, so the resumed turn is told what
+  happened instead of silently continuing.
+
+Two facts make this expressible from a plugin, both verified against the sources
+and re-checked by running the wrapper's own output through the shipped
+`@deepseek-ai/dsh-llm/invariant`:
+
+- the agent loop consumes the `llm/stream` iterable itself
+  (`for await (const chunk of stream) live.push(chunk)`), so a listener's chunk
+  reaches the same assembler an adapter's does;
+- the invariant **requires** a terminal finish chunk and explicitly permits an
+  `error`/`aborted` finish with blocks still open. A quiet `stop` finish is *not*
+  an option — the breaker fires while the call's text block is open, and the
+  invariant rejects that with `finished with N open block(s)`.
+
+Anchoring matters: only the **trailing** run is counted, so an early legitimate
+burst (a heading, a repeated log prefix) followed by real work does not trip it,
+while a call that is stuck right now does.
+
+There is deliberately **no model fallback and no automatic retry** by this
+plugin: silently re-billing a degenerate model would be worse than the loop.
+
 ## Install
 
 Load it as an `@deepseek-ai/cordis` plugin in your `dsh` profile, or mount the
@@ -89,6 +129,12 @@ interface Config {
   maxFires?: number
   /** Cancel cause when escalate is 'cancel'. Default 'thinking-loop'. */
   cancelCause?: string
+  /** Consecutive identical visible-output chunks that end the stream mid-call. 0 disables. Default 60. */
+  maxRepeatedText?: number
+  /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
+  breakCode?: string
+  /** Steer the agent after a mid-stream break so the resumed turn is corrected. Default true. */
+  breakCorrection?: boolean
 }
 ```
 
@@ -124,16 +170,24 @@ node node_modules/@argszero/cordis-plugin-thinking-loop-guard/tools/analyze-sess
 ```
 
 ```text
-  #   turn/step   reasonChars  textChars  verdict             fired
-   1  0/0                  33          0  reasoning-only
-   2  0/1                  33          3  repeated-material   repeated-material
+  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  break
+   1  0/0                  33          0       1  reasoning-only
+   2  0/1                  33          3       1  repeated-material   repeated-material   1
 
 stalled steps: 2/2  |  reactions: 1  |  steps that emitted text: 1
+intra-call repetition: 0 call(s) would be cut mid-stream (maxRepeatedText = 60)
 ```
 
+The `repeatedRun` / `break` columns describe the [single-call
+case](#single-call-repetition-maxrepeatedtext). Replayed against a session shaped
+like discussion #2848 — one call streaming 2825 identical text chunks — the tool
+reports `repeatedRun 2825 / BREAK` **while the cross-call verdict stays
+`progress`**, which is the point: that failure is invisible to every per-call
+rule.
+
 - Override the detector knobs to match your profile: `--similarity 0.6`,
-  `--threshold 2`, `--min-chars 512`, `--max-fires 4`. `--json` emits the raw
-  per-step records.
+  `--threshold 2`, `--min-chars 512`, `--max-fires 4`,
+  `--max-repeated-text 60`. `--json` emits the raw per-step records.
 - It reads **both** durable attempt formats: `assistant/chunk` (session format v1,
   dsh ≤ 0.1.2-rc.1) and `assistant/attempt` (session format v2, dsh ≥ 0.1.5).
   Those two names do not overlap, so a reader can only be format-specific — this
@@ -147,6 +201,7 @@ stalled steps: 2/2  |  reactions: 1  |  steps that emitted text: 1
 
 | Version | Change |
 |---|---|
+| 0.1.6 | Adds the **mid-stream breaker** (`maxRepeatedText`, default 60) for discussion [#2848](https://github.com/deepseek-ai/deepseek-harness/discussions/2848): one call repeating the same `text-delta` is now cut *inside* the call with a terminal `REPETITIVE_OUTPUT` finish, because the per-call detectors above cannot reach a call that never ends. The analyzer reports `repeatedRun`/`break`. |
 | 0.1.5 | Ships `tools/analyze-session.mjs`, an offline session analyzer that replays a session jsonl through the same detector (both durable attempt formats). Exposes `./tools/*` in `exports`. |
 | 0.1.0 | First release. Listened on `agent/assistant-stream` — **broken on 0.1.2-rc.1** (that event is 0.1.5-alpha.1-only). Issue #1. |
 | 0.1.1 | Switched to the `llm/stream` waterfall (present on both lines). |
@@ -192,6 +247,14 @@ The npm `latest` tag for `@deepseek-ai/dsh` is `0.1.2-rc.1`, while the `next` an
 comparators are needed. v0.1.1 shipped the first form and could not be installed
 at all (`ETARGET`); v0.1.2 shipped the second and rejected the `0.1.5` line
 (`ERESOLVE`).
+
+The range deliberately admits **only** the two lines this plugin is tested on.
+Its admitted set over every currently published dsh version is exactly
+`0.1.2-rc.1`, `0.1.5-alpha.1`, `0.1.5-alpha.2`, `0.1.5-rc.1`, `0.1.5-rc.2`;
+older prereleases (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`, `0.1.3-alpha.2`)
+get a loud `ERESOLVE` rather than a silent runtime failure on a generation the
+guard has never been exercised against. Add a comparator for your line only after
+running the suite against it.
 
 ### Why `inject` is required
 

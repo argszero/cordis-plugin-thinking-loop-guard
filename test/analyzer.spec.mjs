@@ -137,3 +137,51 @@ test('analyzer verdicts agree with the shipped LoopDetector for the same input',
   ]
   assert.deepEqual(analyzed.steps.map(s => s.verdict), direct.map(r => r ?? 'progress'))
 })
+
+/* -------------------------------------------------------------------------- */
+/* the issue #2848 shape: one call that repeats itself forever                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The reported session had ONE model call streaming ~2825 identical text
+ * chunks (~420,000 characters). It never finished, so no per-call verdict can
+ * describe it — the only useful question is whether the intra-call breaker would
+ * have stopped it, which is what `repeatedRun`/`wouldBreak` report.
+ */
+test('analyzer flags a single call that repeats one sentence to the end', () => {
+  const sentence = 'The `register` API matches. '
+  const texts = Array.from({ length: 300 }, (_, i) => [i, sentence])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 20, stream: [
+      { type: 'text-chunks', time0: 0, texts },
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+    ] } },
+  ])
+  const { steps } = run(file, ['--max-repeated-text', '60'])
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].repeatedRun, 300, 'the whole call is one identical-chunk run')
+  assert.equal(steps[0].wouldBreak, true)
+  assert.equal(steps[0].textChunks, 300)
+})
+
+test('analyzer counts only the TRAILING run, so an early repeat is not a break', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'text-chunks', time0: 0, texts: [[0, 'header'], [1, 'header'], [2, 'header'], [3, 'then real work continued here']] },
+    ] } },
+  ])
+  const { steps } = run(file, ['--max-repeated-text', '3'])
+  assert.equal(steps[0].repeatedRun, 1)
+  assert.equal(steps[0].wouldBreak, false)
+})
+
+test('analyzer leaves a healthy multi-chunk call alone', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'text-chunks', time0: 0, texts: [[0, 'chunk one'], [1, 'chunk two'], [2, 'chunk three']] },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].repeatedRun, 1)
+  assert.equal(steps[0].wouldBreak, false)
+})
