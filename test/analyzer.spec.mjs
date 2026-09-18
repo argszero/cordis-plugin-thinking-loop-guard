@@ -208,3 +208,50 @@ test('analyzer leaves a healthy multi-chunk call alone', () => {
   assert.equal(steps[0].repeatedRun, 1)
   assert.equal(steps[0].wouldBreak, false)
 })
+
+/* -------------------------------------------------------------------------- */
+/* the discussion #7043 shape: a call cycling a few lines instead of working   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The tool answers "would the shipped breaker have cut this call?" — so it must
+ * answer it for BOTH rules the plugin ships. This fixture is the reported shape
+ * exactly: `好。 / 发。 / 好。 / 好。` cycled for tens of lines, where a tool call
+ * belonged. Its identical-delta run is 2, which is why the chunk rule alone
+ * reported "nothing to see" on the very session the reporter would analyze.
+ */
+test('analyzer flags a call cycling a few short lines, which the chunk rule misses', () => {
+  const cycle = '好。\n发。\n好。\n好。\n'
+  const texts = cycle.repeat(40).split(/(?<=\n)/).filter(s => s !== '').map((text, i) => [i, text])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 4, step: 9, stream: [
+      { type: 'text-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].repeatedRun, 2, 'the chunk rule cannot see a cycle')
+  assert.ok(steps[0].cycleSpan >= 256, `the cycle rule must see it, got ${steps[0].cycleSpan}`)
+  assert.equal(steps[0].wouldBreak, true)
+  assert.equal(steps[0].wouldBreakBy, 'repeating-cycle')
+})
+
+test('analyzer reads the same shape from the v1 assistant/chunk format', () => {
+  const cycle = '好。\n发。\n好。\n好。\n'
+  const lines = cycle.repeat(40).split(/(?<=\n)/).filter(s => s !== '')
+    .map((text, i) => ({ type: 'assistant/chunk', seq: i, time: 0, data: { turn: 0, step: 0, chunk: { type: 'text-delta', index: 0, text } } }))
+  const { steps } = run(writeSession(lines))
+  assert.equal(steps[0].wouldBreakBy, 'repeating-cycle')
+})
+
+test('analyzer does not flag a legitimately repetitive but healthy call', () => {
+  // The false-positive control at the tool level too: generated CSS rows look
+  // periodic to a coverage measure and are not periodic.
+  const texts = Array.from({ length: 40 }, (_, i) => [i, `.row-${i} { display: flex; align-items: center; gap: 8px; }\n`])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'text-chunks', time0: 0, texts }] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].cycleSpan, 0)
+  assert.equal(steps[0].wouldBreak, false)
+})

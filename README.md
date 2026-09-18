@@ -99,6 +99,53 @@ while a call that is stuck right now does.
 There is deliberately **no model fallback and no automatic retry** by this
 plugin: silently re-billing a degenerate model would be worse than the loop.
 
+## Cycled repetition (`maxRepeatedCycleChars`)
+
+Counting identical *deltas* only covers the period-1 case. The next report of the
+same failure mode is a **cycle**, and it slips straight through:
+
+> [discussion #7043](https://github.com/deepseek-ai/deepseek-harness/discussions/7043)
+> — a long session (≈150 turns, heavy tool use, Windows, `deepseek-flash`) where
+> the assistant starts emitting the same few meaningless short lines for tens of
+> lines — `好。 / 发。 / 好。 / 好。`, and a mixed-language variant with
+> `Emitting.` in front — **where a tool call should have been**. The user sees
+> "it stopped again mid-task"; the model never stopped generating, it just
+> generated nothing else. Frequency rises with session length (0 in the first
+> third, most turns in the last third), and while degenerated it also produced a
+> malformed edit that deleted a function body.
+
+Measured against the previous version, that shape **never fired the breaker** —
+not under any of four chunkings (one delta per line, per cycle, per four
+characters, per character) and not within 40 repeats: the longest run of
+consecutive identical deltas is **2**, against a threshold of 60. A delta-level
+rule cannot see a cycle.
+
+`maxRepeatedCycleChars` (default `64`) adds the missing rule at the character
+level: when the tail of the call's visible output is an **exact repetition** of
+one period no longer than that, spanning at least `minRepeatedCycleChars`
+(default `256`), the same terminal `REPETITIVE_OUTPUT` finish cuts the stream. On
+the reported shapes it fires after ~256–270 characters instead of never.
+
+Why characters and why exactness:
+
+- **Characters**, not lines: the reported period is 12 and 26 characters, and a
+  provider that streams the same bleed with no line break at all is caught
+  identically. Nothing depends on where the newlines land.
+- **Exactness**, not a low-entropy ratio: measured on the same texts, a coverage
+  measure reads **0.92–0.99** for the two reported shapes at a 512-character
+  tail, but **0.72** for a 40-row markdown table, **0.76** for a 60-line log
+  listing, **0.82** for generated CSS rows and **0.84** for a JSON dump.
+  Separating "degenerate" from "legitimately repetitive" by 0.06 is not a margin
+  worth truncating a user's call over. Verbatim periodicity is **0** for every
+  one of those samples.
+- A period must contain **at least two distinct characters**, so a long `=====` or
+  `─────` rule line in a generated document is never read as a loop.
+
+Both rules share one breaker and report which one fired in the log line
+(`rule: identical-chunks` / `rule: repeating-cycle`). `maxRepeatedCycleChars: 0`
+disables the cycle rule alone; `maxRepeatedText: 0` disables the chunk rule
+alone.
+
 ## Install
 
 Load it as an `@deepseek-ai/cordis` plugin in your `dsh` profile, or mount the
@@ -131,6 +178,10 @@ interface Config {
   cancelCause?: string
   /** Consecutive identical visible-output chunks that end the stream mid-call. 0 disables. Default 60. */
   maxRepeatedText?: number
+  /** Longest repeating period of the visible output, in characters, that ends the stream mid-call. 0 disables. Default 64. */
+  maxRepeatedCycleChars?: number
+  /** Shortest tail span that must be an exact repetition of one period before the cycle rule fires. Default 256. */
+  minRepeatedCycleChars?: number
   /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
   breakCode?: string
   /** Steer the agent after a mid-stream break so the resumed turn is corrected. Default true. */
@@ -201,6 +252,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.1.8 | Adds the **cycle rule** (`maxRepeatedCycleChars`, default 64; `minRepeatedCycleChars`, default 256) for discussion [#7043](https://github.com/deepseek-ai/deepseek-harness/discussions/7043): a call bleeding a *cycle* of short lines no longer needs 60 byte-identical deltas to be cut. Measured, the previous version never fired on that shape under any chunking (longest identical run 2). Exact verbatim periodicity was chosen over a low-entropy ratio because the ratio only separates the loop from legitimately repetitive output by ~0.06. The breaker now logs which rule fired. |
 | 0.1.7 | Admits the **0.1.3-alpha.2 line and the whole 0.1.6 line**. The shipped range had gone stale: it refused the newest dsh release, so `npm install` failed with `ERESOLVE` for a plugin whose suite passes there. Every admitted line is now one the suite has been run against with all dsh peers pinned to it. `test/peer-range.spec.mjs` computes the admitted set with `semver` instead of pattern-matching the range string. |
 | 0.1.6 | Adds the **mid-stream breaker** (`maxRepeatedText`, default 60) for discussion [#2848](https://github.com/deepseek-ai/deepseek-harness/discussions/2848): one call repeating the same `text-delta` is now cut *inside* the call with a terminal `REPETITIVE_OUTPUT` finish, because the per-call detectors above cannot reach a call that never ends. The analyzer reports `repeatedRun`/`break`. |
 | 0.1.5 | Ships `tools/analyze-session.mjs`, an offline session analyzer that replays a session jsonl through the same detector (both durable attempt formats). Exposes `./tools/*` in `exports`. |

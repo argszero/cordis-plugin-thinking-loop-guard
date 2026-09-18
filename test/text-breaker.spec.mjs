@@ -29,6 +29,11 @@ const CONFIG = {
   maxRepeatedText: 4,
   breakCode: 'REPETITIVE_OUTPUT',
   breakCorrection: true,
+  // The cycle rule (discussion #7043) is on by default in the shipped schema;
+  // every assertion above is about the *chunk* rule, so it is switched off here
+  // explicitly rather than left to be undefined. The cycle suite below opts in.
+  maxRepeatedCycleChars: 0,
+  minRepeatedCycleChars: 512,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -283,6 +288,128 @@ test('varying visible output never trips the breaker', async () => {
   for await (const chunk of ctx.fire(options, () => varying())) out.push(chunk)
   assert.equal(out.filter(c => c.type === 'text-delta').length, 200)
   assert.equal(agent.steered.length, 0)
+})
+
+/* -------------------------------------------------------------------------- */
+/* the cycle rule — discussion #7043                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The two shapes as reported: a four-line cycle of short CJK fragments, and the
+ * mixed-language variant that proves the bleed crosses a language boundary.
+ * Both are cycled periods, not repeated deltas — the distinction the chunk rule
+ * cannot see.
+ */
+const CYCLE_ZH = '好。\n发。\n好。\n好。\n'
+const CYCLE_MIXED = 'Emitting.\n好。\n发。\n好。\n好。\n'
+
+/** The rule under test, on its shipped defaults, with the chunk rule off. */
+const CYCLE_ON = { ...CONFIG, maxRepeatedText: 0, maxRepeatedCycleChars: 64, minRepeatedCycleChars: 256 }
+
+/** One delta per line: the least favourable chunking for a delta-based rule. */
+function lineDeltas(cycle, repeats) {
+  return cycle.repeat(repeats).split(/(?<=\n)/).filter(s => s !== '')
+}
+
+test('trailingCycle finds a short verbatim period and ignores everything else', () => {
+  assert.equal(plugin.trailingCycle('nothing repeats here at all', 64, 256), 0)
+  assert.equal(plugin.trailingCycle(CYCLE_ZH.repeat(40), 64, 256), 256, '12-char period, span reported at the minimum')
+  assert.equal(plugin.trailingCycle(CYCLE_MIXED.repeat(40), 64, 256), 256, '26-char period, same contract')
+  assert.equal(plugin.trailingCycle(CYCLE_ZH.repeat(5), 64, 256), 0, 'a span below the minimum is not a bleed')
+})
+
+test('trailingCycle refuses a one-character period, so long divider lines survive', () => {
+  // '=' * 400 is technically periodic; a generated document may legitimately
+  // contain a long rule line, and the chunk rule still covers the pathological
+  // single-character bleed.
+  assert.equal(plugin.trailingCycle('='.repeat(400), 64, 256), 0)
+  assert.equal(plugin.trailingCycle('─'.repeat(400), 64, 256), 0)
+})
+
+test('the reported shape trips the cycle rule, and the chunk rule would not have', () => {
+  const d = new TextRepetitionDetector({ ...CYCLE_ON, maxRepeatedText: 60 })
+  let fired = 0
+  for (const delta of lineDeltas(CYCLE_ZH, 40)) if (d.push(delta)) fired++
+  assert.equal(fired, 1, 'exactly one delta completes the detection')
+  assert.equal(d.trippedBy, 'repeating-cycle')
+  assert.ok(d.emittedChars < 400, `must fire inside the first few hundred characters, fired at ${d.emittedChars}`)
+  assert.equal(countRepeatedText(lineDeltas(CYCLE_ZH, 40)), 2, 'the chunk rule sees a run of only 2 — that is the bug')
+})
+
+test('the mixed-language variant trips the same way', () => {
+  const d = new TextRepetitionDetector(CYCLE_ON)
+  for (const delta of lineDeltas(CYCLE_MIXED, 40)) if (d.push(delta)) break
+  assert.equal(d.tripped, true)
+  assert.equal(d.trippedBy, 'repeating-cycle')
+})
+
+test('a bleed emitted without any newline is caught identically', () => {
+  // The reported shape is displayed as lines, but a provider may stream the same
+  // bleed with no line break at all; a character-level period does not care.
+  const d = new TextRepetitionDetector(CYCLE_ON)
+  for (let i = 0; i < 60; i++) if (d.push('好。发。好。好。')) break
+  assert.equal(d.tripped, true)
+})
+
+test('legitimately repetitive output is NOT flagged (the false-positive control)', () => {
+  // These are the samples the ratio-based alternative would have been ~0.06 away
+  // from: a real table, generated CSS, a JSON dump, a log listing, repeated code
+  // stubs and a uniform bullet list. Every one is periodic-looking to a coverage
+  // measure and none of them is periodic.
+  const samples = {
+    'markdown table': '| id | name | status |\n| --- | --- | --- |\n'
+      + Array.from({ length: 40 }, (_, i) => `| ${i} | item-${i} | ${i % 2 ? 'ok' : 'pending'} |\n`).join(''),
+    'generated css': Array.from({ length: 40 }, (_, i) => `.row-${i} { display: flex; align-items: center; gap: 8px; }\n`).join(''),
+    'json dump': JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ id: i, kind: 'item', enabled: true })), null, 2),
+    'log listing': Array.from({ length: 60 }, (_, i) => `2026-09-18T16:0${i % 10}:00 INFO processing record ${i} done\n`).join(''),
+    'code stubs': Array.from({ length: 40 }, (_, i) => `export function handler${i}(ctx: Context): void {\n  ctx.logger.info('handler ${i}')\n}\n`).join(''),
+    'bullet list': Array.from({ length: 40 }, (_, i) => `- step ${i + 1}: run the same command and check the output\n`).join(''),
+  }
+  for (const [label, text] of Object.entries(samples)) {
+    const d = new TextRepetitionDetector(CYCLE_ON)
+    let tripped = false
+    for (const delta of text.split(/(?<=\n)/)) if (d.push(delta)) { tripped = true; break }
+    assert.equal(tripped, false, `${label} must not be flagged`)
+  }
+})
+
+test('`maxRepeatedCycleChars: 0` disables the cycle rule but not the chunk rule', () => {
+  const d = new TextRepetitionDetector({ ...CYCLE_ON, maxRepeatedText: 4, maxRepeatedCycleChars: 0 })
+  for (const delta of lineDeltas(CYCLE_ZH, 40)) d.push(delta)
+  assert.equal(d.tripped, false, 'the cycle rule is off')
+  for (let i = 0; i < 4; i++) d.push('tick')
+  assert.equal(d.tripped, true)
+  assert.equal(d.trippedBy, 'identical-chunks')
+})
+
+test('a cycled stream is cut through apply() with a terminal error finish', async () => {
+  // The helper test above cannot see whether the wrapper actually stops the call;
+  // this is the assertion that fails if the breaker counts but never emits.
+  const agent = fakeAgent()
+  const ctx = fakeContext(agent)
+  plugin.apply(ctx, CYCLE_ON)
+  const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
+  const deltas = lineDeltas(CYCLE_ZH, 40)
+  async function* cycled() {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    for (const text of deltas) yield { type: 'text-delta', index: 0, text }
+  }
+  const out = []
+  for await (const chunk of ctx.fire(options, () => cycled())) out.push(chunk)
+
+  assert.ok(out.filter(c => c.type === 'text-delta').length < deltas.length, 'the stream must be cut, not drained')
+  assert.equal(out.at(-1).type, 'finish')
+  assert.equal(out.at(-1).reason.kind, 'error')
+  assert.equal(out.at(-1).reason.failure.code, 'REPETITIVE_OUTPUT')
+  assert.equal(agent.steered.length, 1, 'the correction must be queued before the error finish')
+})
+
+test('the schema ships the cycle rule on, with its documented defaults', () => {
+  const resolved = plugin.Config({})
+  assert.equal(resolved.maxRepeatedCycleChars, 64)
+  assert.equal(resolved.minRepeatedCycleChars, 256)
+  assert.equal(plugin.Config({ maxRepeatedCycleChars: 0 }).maxRepeatedCycleChars, 0, '0 must survive as the off switch')
+  assert.throws(() => plugin.Config({ minRepeatedCycleChars: 1 }))
 })
 
 /* -------------------------------------------------------------------------- */

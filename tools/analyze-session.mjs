@@ -29,11 +29,18 @@
  * identical visible-output chunks inside one call, which is the only measure
  * that describes a call repeating itself for minutes without ever ending. That
  * shape is invisible to every per-call verdict on purpose — the call never
- * completes — so it gets its own column. Pass `--max-repeated-text` to see
- * whether the shipped breaker would have cut that call.
+ * completes — so it gets its own column. Two columns after it answer "would the
+ * shipped breaker have cut this call?" for both rules the plugin ships:
+ * `repeatedRun` (identical deltas, `--max-repeated-text`) and `cycleSpan` (the
+ * exact verbatim period at the tail, `--max-repeated-cycle`).
+ *
+ * The cycle rule exists because of discussion #7043: a call bleeding `好。 / 发。 /
+ * 好。 / 好。` for tens of lines has a run of identical deltas of 2, so the chunk
+ * rule never fires — and the reporter's session file is exactly what this tool
+ * is pointed at to answer whether the shipped plugin would have cut it.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, countRepeatedText } from '../lib/index.js'
+import { LoopDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -42,13 +49,15 @@ const DEFAULT_CONFIG = {
   similarityThreshold: 0.8,
   maxFires: 4,
   maxRepeatedText: 60,
+  maxRepeatedCycleChars: 64,
+  minRepeatedCycleChars: 256,
 }
 
 function parseArgs(argv) {
   const config = { ...DEFAULT_CONFIG }
   let file
   let asJson = false
-  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires', '--max-repeated-text': 'maxRepeatedText' }
+  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires', '--max-repeated-text': 'maxRepeatedText', '--max-repeated-cycle': 'maxRepeatedCycleChars', '--min-repeated-cycle': 'minRepeatedCycleChars' }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--json') { asJson = true; continue }
@@ -177,6 +186,14 @@ for (const [index, step] of steps.entries()) {
   const reason = detector.observe({ hasOutput: step.hasOutput, reasoning: step.reasoning })
   const fire = detector.takeFire()
   const repeatRun = countRepeatedText(step.texts)
+  // Both rules run on the SAME input the plugin's breaker sees: text deltas
+  // only, in stream order. This tool exists to answer "would the shipped breaker
+  // have cut this call?", so a rule the plugin has but the tool does not would
+  // make the tool quietly wrong.
+  const cycleSpan = trailingCycle(step.texts.join(''), config.maxRepeatedCycleChars, config.minRepeatedCycleChars)
+  const byChunks = config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText
+  const byCycle = cycleSpan > 0
+  const wouldBreakBy = byChunks ? 'identical-chunks' : (byCycle ? 'repeating-cycle' : null)
   report.push({
     step: index + 1,
     turn: step.turn,
@@ -191,7 +208,9 @@ for (const [index, step] of steps.entries()) {
     // identical visible-output chunks; `wouldBreak` answers whether the shipped
     // breaker would have ended this call mid-stream.
     repeatedRun: repeatRun,
-    wouldBreak: config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText,
+    cycleSpan,
+    wouldBreak: wouldBreakBy !== null,
+    wouldBreakBy,
   })
 }
 const broken = report.filter(r => r.wouldBreak).length
@@ -203,13 +222,14 @@ if (asJson) {
   console.log(`config:  ${JSON.stringify(config)}`)
   console.log(`steps:   ${steps.length} model call(s)`)
   console.log('')
-  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  break')
+  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  break')
   for (const row of report) {
     console.log(
       `  ${String(row.step).padStart(2)}  ${String(row.turn)}/${String(row.call)}`.padEnd(20)
       + `${String(row.reasoningChars).padStart(9)}  ${String(row.textChars).padStart(9)}  `
       + `${String(row.textChunks).padStart(6)}  ${row.verdict.padEnd(18)}  ${String(row.fired ?? '').padEnd(5)}  `
-      + `${String(row.repeatedRun).padStart(11)}  ${row.wouldBreak ? 'BREAK' : ''}`,
+      + `${String(row.repeatedRun).padStart(11)}  ${String(row.cycleSpan).padStart(9)}  `
+      + `${row.wouldBreak ? `BREAK(${row.wouldBreakBy})` : ''}`,
     )
   }
   const stalls = report.filter(r => r.verdict !== 'progress').length
@@ -217,8 +237,13 @@ if (asJson) {
   const withText = report.filter(r => r.hasOutput).length
   console.log('')
   console.log(`stalled steps: ${stalls}/${report.length}  |  reactions: ${fires}  |  steps that emitted text: ${withText}`)
-  console.log(`intra-call repetition: ${broken} call(s) would be cut mid-stream (maxRepeatedText = ${config.maxRepeatedText})`)
-  if (broken === 0 && report.some(r => r.repeatedRun > 1)) {
+  const byChunks = report.filter(r => r.wouldBreakBy === 'identical-chunks').length
+  const byCycle = report.filter(r => r.wouldBreakBy === 'repeating-cycle').length
+  console.log(`intra-call repetition: ${broken} call(s) would be cut mid-stream `
+    + `(${byChunks} by identical chunks, maxRepeatedText = ${config.maxRepeatedText}; `
+    + `${byCycle} by a repeating cycle, maxRepeatedCycleChars = ${config.maxRepeatedCycleChars}, `
+    + `minRepeatedCycleChars = ${config.minRepeatedCycleChars})`)
+  if (byCycle === 0 && byChunks === 0 && report.some(r => r.repeatedRun > 1)) {
     const worst = Math.max(...report.map(r => r.repeatedRun))
     console.log(`  (the longest identical-chunk run seen was ${worst}; lower --max-repeated-text to cut such calls)`)
   }

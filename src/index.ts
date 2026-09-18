@@ -76,6 +76,35 @@
  * what happened. Deliberately **no model fallback and no automatic retry**: a
  * degenerate model must not be silently re-billed.
  *
+ * ## Cycled repetition (discussion #7043, v0.1.8)
+ *
+ * `maxRepeatedText` compares *deltas*, so it only covers the period-1 case: the
+ * same payload emitted over and over. The #7043 report is a **cycle** — a few
+ * short lines rotating ("好。 / 发。 / 好。 / 好。", and a mixed-language variant
+ * with "Emitting." in front) for tens of lines, and the same signature in a long
+ * session where the model bleeds instead of calling the tool it obviously means
+ * to call. Measured against the shipped v0.1.7 detector, that shape **never
+ * fires under any of four chunkings** (one delta per line, per cycle, per four
+ * characters, per character) within 40 repeats: the longest run of identical
+ * consecutive deltas is 3, against a threshold of 60.
+ *
+ * `maxRepeatedCycleChars` / `minRepeatedCycleChars` add the missing rule at the
+ * character level: when the tail of the call's visible output is an exact
+ * repetition of one period no longer than `maxRepeatedCycleChars` and spanning
+ * at least `minRepeatedCycleChars`, the stream is cut by the same terminal
+ * `error` finish. Character-level because the shape does not depend on line
+ * breaks — a provider that streams the same bleed with no newline at all is
+ * caught identically — and because the reported period is short (12 and 26
+ * characters for the two reported shapes).
+ *
+ * Why exactness and not a low-entropy ratio, when `repeatRatio` was already in
+ * the file: measured on the same texts, a *coverage* measure reads 0.92-0.99 for
+ * the two reported shapes at a 512-character tail but 0.72 for a 40-row
+ * markdown table, 0.76 for a log listing, 0.82 for generated CSS rows and 0.84
+ * for a JSON dump. Separating "degenerate" from "legitimately repetitive" by
+ * 0.06 is not a margin worth truncating a user's call over; verbatim
+ * periodicity is 0 for every one of those samples.
+ *
  * ## Reaction
  *
  * On a threshold crossing it applies `escalate`. Unlike v0.1.2 it does **not**
@@ -155,8 +184,35 @@ export interface Config {
    * mid-call. `0` disables the breaker. This is the only guard here that fires
    * *inside* a model call, so it is the only one that can stop a single-call
    * repetition bleed (issue #2848). Default `60`.
+   *
+   * Covers the period-1 case only (a byte-identical delta repeated); a model
+   * bleeding a *cycle* of a few short lines resets this counter on every phase
+   * change. See `maxRepeatedCycleChars`.
    */
   maxRepeatedText?: number
+  /**
+   * Longest repeating period, in visible-output characters, that
+   * {@link trailingCycle} will recognize at the tail of a call's output.
+   * `0` disables the cycle rule. Default `64`.
+   *
+   * Discussion #7043 reported a model that bleeds a cycle of a few short lines
+   * ("好。 / 发。 / 好。 / 好。", and a mixed-language variant) for tens of
+   * lines; measured on v0.1.7, that shape never fires `maxRepeatedText` under any
+   * chunking, because no two consecutive deltas are identical.
+   */
+  maxRepeatedCycleChars?: number
+  /**
+   * Shortest tail span that must be an exact repetition of a single period before
+   * the cycle rule ends the stream. Default `256`.
+   *
+   * Exact repetition rather than a low-entropy ratio on purpose: measured against
+   * legitimately repetitive long output — a 40-row markdown table (0.72 at a
+   * 512-char tail), generated CSS rows (0.82), a JSON dump (0.84), a log listing
+   * (0.76) — a coverage threshold only separates the loop (0.92-0.99) by ~0.06,
+   * too thin for a rule that truncates a call. Verbatim periodicity is 0 for all
+   * of those samples and non-zero only for the reported shapes.
+   */
+  minRepeatedCycleChars?: number
   /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
@@ -187,6 +243,8 @@ export const Config: z<Config> = z.object({
   maxFires: z.number().min(1).default(4),
   cancelCause: z.string().default('thinking-loop'),
   maxRepeatedText: z.number().step(1).min(0).default(60),
+  maxRepeatedCycleChars: z.number().step(1).min(0).default(64),
+  minRepeatedCycleChars: z.number().step(1).min(2).default(256),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
 })
@@ -224,6 +282,13 @@ function message(text: string, form: 'notice'): UserMessage {
 
 /** Fixed window used for both the intra-call and cross-call measures. */
 export const GRAM_SIZE = 4
+
+/**
+ * How many newly emitted visible characters must accumulate before the cycle
+ * rule re-scans the tail. The scan is bounded by `minRepeatedCycleChars`, so a
+ * fixed stride keeps the whole rule linear in emitted characters.
+ */
+const CYCLE_CHECK_STRIDE = 32
 
 /**
  * The distinct fixed-length grams of one reasoning text.
@@ -421,6 +486,52 @@ export function countRepeatedText(texts: readonly string[]): number {
 }
 
 /**
+ * The tail span that is an exact repetition of one short period, or `0` when the
+ * tail is not periodic (discussion #7043).
+ *
+ * This generalizes {@link countRepeatedText} from "the same delta twice" to
+ * "the same *cycled* output for hundreds of characters", and it is
+ * newline-agnostic: the period is measured in characters, so a bleed that never
+ * emits a line break is caught identically to a one-line-per-delta bleed.
+ *
+ * Two guards keep it off legitimate output:
+ *
+ *  - **Exactness.** The whole span must be a verbatim repetition; a near-repeat
+ *    scores `0`. Measured: a 40-row markdown table, generated CSS rows, a JSON
+ *    dump and a 60-line log listing are all period-free while scoring
+ *    0.72-0.84 on a *coverage* measure of the same text — a ratio rule would
+ *    have had to separate the loop from those by ~0.06.
+ *  - **A period of at least two distinct characters.** A run of `=` or `-` is a
+ *    legitimate divider, and a one-character period would flag every long rule
+ *    line in a generated document.
+ *
+ * The scan stops as soon as the minimum is met, so the returned span is
+ * `max(minSpan, 2 * period)` rather than the longest periodic tail that exists:
+ * the caller only distinguishes zero from non-zero, and stopping early keeps the
+ * rule bounded on a call that bleeds for hundreds of thousands of characters.
+ *
+ * @param text - the accumulated visible output of one call.
+ * @param maxPeriod - the longest period to consider, in characters.
+ * @param minSpan - the shortest qualifying tail span, in characters.
+ * @returns the qualifying span in characters (`>= minSpan`), or `0`.
+ */
+export function trailingCycle(text: string, maxPeriod: number, minSpan: number): number {
+  if (maxPeriod < 1) return 0
+  for (let period = 1; period <= maxPeriod; period++) {
+    // The last `period` characters are the template; walk backwards while the
+    // output still matches itself one period earlier.
+    const template = text.slice(text.length - period)
+    if (new Set(template).size < 2) continue
+    const need = Math.max(minSpan, 2 * period) - period
+    const limit = Math.min(text.length - period, need)
+    let matched = 0
+    while (matched < limit && text[text.length - period - 1 - matched] === text[text.length - 1 - matched]) matched++
+    if (matched >= need) return matched + period
+  }
+  return 0
+}
+
+/**
  * The intra-call breaker: watches one call's visible output and reports when the
  * model has repeated itself enough to be considered degenerate.
  *
@@ -433,6 +544,9 @@ export function countRepeatedText(texts: readonly string[]): number {
 export class TextRepetitionDetector {
   private texts: string[] = []
   private broken = false
+  private visible = ''
+  private lastCycleCheck = 0
+  private reason: 'identical-chunks' | 'repeating-cycle' | undefined
 
   /**
    * @param config - the resolved plugin configuration.
@@ -442,6 +556,11 @@ export class TextRepetitionDetector {
   /** Whether the breaker has already fired for this call. */
   get tripped(): boolean {
     return this.broken
+  }
+
+  /** Which rule fired, for the log line and for tests. */
+  get trippedBy(): 'identical-chunks' | 'repeating-cycle' | undefined {
+    return this.reason
   }
 
   /** How many characters the call had emitted when the breaker tripped. */
@@ -461,12 +580,26 @@ export class TextRepetitionDetector {
   push(text: string): boolean {
     if (this.broken) return false
     this.chars += text.length
-    if (this.config.maxRepeatedText <= 0) return false
+    if (this.config.maxRepeatedText <= 0 && this.config.maxRepeatedCycleChars <= 0) return false
     this.texts.push(text)
-    if (this.texts.length < this.config.maxRepeatedText) return false
-    const run = countRepeatedText(this.texts)
-    if (run < this.config.maxRepeatedText) return false
+    if (this.config.maxRepeatedText > 0
+      && this.texts.length >= this.config.maxRepeatedText
+      && countRepeatedText(this.texts) >= this.config.maxRepeatedText) {
+      this.broken = true
+      this.reason = 'identical-chunks'
+      return true
+    }
+    if (this.config.maxRepeatedCycleChars <= 0) return false
+    this.visible += text
+    // The scan grows with the qualifying span, so run it on a fixed stride
+    // rather than per delta: a bleed is hundreds of characters long and 32
+    // characters of latency cost nothing next to the cost of not firing.
+    if (this.visible.length - this.lastCycleCheck < CYCLE_CHECK_STRIDE) return false
+    this.lastCycleCheck = this.visible.length
+    const span = trailingCycle(this.visible, this.config.maxRepeatedCycleChars, this.config.minRepeatedCycleChars)
+    if (span === 0) return false
     this.broken = true
+    this.reason = 'repeating-cycle'
     return true
   }
 }
@@ -543,9 +676,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param chars - visible-output characters emitted before the break.
    * @returns the terminal chunk to yield as the call's last.
    */
-  function breakStream(agent: GuardableAgent, chars: number): StreamChunk {
+  function breakStream(agent: GuardableAgent, chars: number, rule: 'identical-chunks' | 'repeating-cycle'): StreamChunk {
     const detail = `the model repeated the same visible output for ${chars} characters in one call`
-    ctx.logger.warn(`thinking-loop-guard: breaking a repetitive stream (${chars} chars, one call)`)
+    ctx.logger.warn(`thinking-loop-guard: breaking a repetitive stream (${chars} chars, one call, rule: ${rule})`)
     if (config.breakCorrection) {
       agent.steer(message(
         `Your output had repeated itself for ${chars} characters without progressing, so the response was `
@@ -585,7 +718,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         // finish, and its breaker already reacted.
         if (chunk.type === 'text-delta' && textBreaker.push(chunk.text)) {
           // `return` here ends the generator — this is not the C# `yield break`.
-          yield breakStream(agent, textBreaker.emittedChars)
+          yield breakStream(agent, textBreaker.emittedChars, textBreaker.trippedBy ?? 'identical-chunks')
           return
         }
       }
