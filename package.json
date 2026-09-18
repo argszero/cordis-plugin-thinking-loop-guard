@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects three per-call shapes (reasoning-only calls, restated-material calls, self-repeating low-entropy reasoning) and re-fires instead of latching; plus a mid-stream breaker (maxRepeatedText) that ends a single call repeating its visible output, which no post-call detector can reach. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with dsh 0.1.2-rc.1 and the 0.1.5 line.",
-  "version": "0.1.6",
+  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects three per-call shapes (reasoning-only calls, restated-material calls, self-repeating low-entropy reasoning) and re-fires instead of latching; plus a mid-stream breaker (maxRepeatedText) that ends a single call repeating its visible output, which no post-call detector can reach. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2.",
+  "version": "0.1.7",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -42,16 +42,17 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0",
-    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0"
+    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-agent": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
+    "semver": "^7.8.5",
     "typescript": "^5.5.0"
   },
   "scripts": {

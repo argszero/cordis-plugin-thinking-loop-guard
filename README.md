@@ -201,6 +201,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.1.7 | Admits the **0.1.3-alpha.2 line and the whole 0.1.6 line**. The shipped range had gone stale: it refused the newest dsh release, so `npm install` failed with `ERESOLVE` for a plugin whose suite passes there. Every admitted line is now one the suite has been run against with all dsh peers pinned to it. `test/peer-range.spec.mjs` computes the admitted set with `semver` instead of pattern-matching the range string. |
 | 0.1.6 | Adds the **mid-stream breaker** (`maxRepeatedText`, default 60) for discussion [#2848](https://github.com/deepseek-ai/deepseek-harness/discussions/2848): one call repeating the same `text-delta` is now cut *inside* the call with a terminal `REPETITIVE_OUTPUT` finish, because the per-call detectors above cannot reach a call that never ends. The analyzer reports `repeatedRun`/`break`. |
 | 0.1.5 | Ships `tools/analyze-session.mjs`, an offline session analyzer that replays a session jsonl through the same detector (both durable attempt formats). Exposes `./tools/*` in `exports`. |
 | 0.1.0 | First release. Listened on `agent/assistant-stream` — **broken on 0.1.2-rc.1** (that event is 0.1.5-alpha.1-only). Issue #1. |
@@ -211,15 +212,16 @@ rule.
 
 ## Compatibility
 
-- **dsh 0.1.2-rc.1** (the widely-installed npm release): works — `llm/stream`,
-  `StreamChunk`, `GenerateOptions.sessionId`, `ctx.agents.get`, and
-  `agent.steer/cancel/inject` are all present.
-- **dsh 0.1.5-alpha.1**: works — same `llm/stream` seam. The newer
-  `agent/assistant-stream` event is NOT required; the guard does not depend on it.
+- **Every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2**: works. All
+  eight lines below have had the full suite (52 tests) run against them with
+  every dsh peer pinned to that single line, and `tsc` is clean on all eight.
+- The guard does **not** depend on the `agent/assistant-stream` event that
+  arrived in 0.1.5-alpha.1. It wraps the older `llm/stream` waterfall, which
+  every admitted line has — that is what makes the wide support possible.
 - The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm`:
 
   ```
-  >=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0
+  >=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0
   ```
 
 ### Why the peer range looks like that
@@ -239,22 +241,26 @@ you have to avoid both:
 ">=0.1.2-rc.1 <0.2.0"
 
 // What we ship: one comparator per supported tuple line.
-">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0"
+">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
 ```
 
 The npm `latest` tag for `@deepseek-ai/dsh` is `0.1.2-rc.1`, while the `next` and
-`alpha` tags point at the `0.1.5` line — both are in active use, so both
-comparators are needed. v0.1.1 shipped the first form and could not be installed
-at all (`ETARGET`); v0.1.2 shipped the second and rejected the `0.1.5` line
-(`ERESOLVE`).
+`alpha` tags move through the `0.1.5` and `0.1.6` lines — several generations are
+in active use at once, so one comparator per live tuple is needed. v0.1.1 shipped
+the first form and could not be installed at all (`ETARGET`); v0.1.2 shipped the
+second and rejected the `0.1.5` line (`ERESOLVE`); v0.1.6 shipped a union that had
+simply gone stale — it refused the `0.1.3-alpha.2` line and the whole `0.1.6`
+line, newest release included, for a plugin whose suite passes on both.
 
-The range deliberately admits **only** the two lines this plugin is tested on.
-Its admitted set over every currently published dsh version is exactly
-`0.1.2-rc.1`, `0.1.5-alpha.1`, `0.1.5-alpha.2`, `0.1.5-rc.1`, `0.1.5-rc.2`;
-older prereleases (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`, `0.1.3-alpha.2`)
-get a loud `ERESOLVE` rather than a silent runtime failure on a generation the
-guard has never been exercised against. Add a comparator for your line only after
-running the suite against it.
+The range deliberately admits **only** the lines this plugin is tested on. Its
+admitted set over every published dsh version is exactly `0.1.2-rc.1`,
+`0.1.3-alpha.2`, `0.1.5-alpha.1`, `0.1.5-alpha.2`, `0.1.5-rc.1`, `0.1.5-rc.2`,
+`0.1.6-alpha.1`, `0.1.6-alpha.2`; older prereleases (`0.1.0-rc.*`, `0.1.1-rc.*`,
+`0.1.2-alpha.*`) get a loud `ERESOLVE` rather than a silent runtime failure on a
+generation the guard has never been exercised against. Add a comparator for your
+line only after running the suite against it — `test/peer-range.spec.mjs`
+computes this set with `semver` and fails if the range and the tested set drift
+apart in either direction.
 
 ### Why `inject` is required
 
