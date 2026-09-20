@@ -61,6 +61,10 @@ function run(file, extra = []) {
   return JSON.parse(out)
 }
 
+function runText(file, extra = []) {
+  return execFileSync(process.execPath, [ANALYZER, file, '--min-chars', '8', '--threshold', '2', ...extra], { encoding: 'utf8' })
+}
+
 test('analyzer reads v1 assistant/chunk events and groups them by (turn, step)', () => {
   const chunk = (turn, step, data) => ({ type: 'assistant/chunk', seq: 0, time: 0, data: { turn, step, chunk: data } })
   const file = writeSession([
@@ -254,4 +258,122 @@ test('analyzer does not flag a legitimately repetitive but healthy call', () => 
   const { steps } = run(file)
   assert.equal(steps[0].cycleSpan, 0)
   assert.equal(steps[0].wouldBreak, false)
+})
+
+/* -------------------------------------------------------------------------- */
+/* issue #1, 2026-09-20: a silent zero is not a verdict                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The reporter ran this tool on a flattened dump, got `stalled 0/161`, and had
+ * to establish BY HAND that the reasoning behind those turns sits in lines the
+ * tool never reads. The tool's own docstring said unknown input degrades to
+ * "fewer steps observed" — but nothing in the output said how many fewer, so a
+ * zero from an unreadable file and a zero from a healthy file printed the same.
+ * These tests pin the disclosure: the counts, the scope note, and the warning.
+ */
+test('coverage names the skipped event types instead of silently answering zero', () => {
+  const file = writeSession([
+    { type: 'turn/start', seq: 0, time: 0, data: { turn: 0 } },
+    { type: 'assistant/attempt', seq: 1, time: 1, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
+    { type: 'user/message', seq: 2, time: 2, data: { turn: 0, step: 1 } },
+    // A flattened dump: stream records hoisted to top-level lines, which carry
+    // no (turn, step) and so cannot be attributed to a call.
+    { type: 'reasoning-chunks', time0: 3, index: 0, dt: [0], texts: ['some reasoning'] },
+    { type: 'reasoning-chunks', time0: 4, index: 0, dt: [0], texts: ['more reasoning'] },
+  ])
+  const { coverage, steps } = run(file)
+  assert.equal(steps.length, 1, 'only the attempt is a readable step')
+  assert.equal(coverage.lines, 6, 'five records plus the trailing newline')
+  assert.equal(coverage.parsed, 1)
+  assert.deepEqual(coverage.parsedByEventType, { 'assistant/attempt': 1 })
+  assert.equal(coverage.skipped, 4)
+  assert.equal(coverage.skippedByType['reasoning-chunks'], 2)
+  assert.equal(coverage.skippedByType['turn/start'], 1)
+  assert.equal(coverage.skippedByType['user/message'], 1)
+  assert.equal(coverage.verdictScopeIncomplete, true, 'stream-shaped lines were skipped')
+})
+
+test('coverage warns in the text output and scopes the stalled count', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
+    { type: 'reasoning-chunks', time0: 1, index: 0, dt: [0], texts: ['unreadable reasoning'] },
+  ])
+  const out = runText(file)
+  assert.match(out, /coverage: \d+ line\(s\) — 1 parsed \(assistant\/attempt 1\), 1 skipped/)
+  assert.match(out, /skipped by type: reasoning-chunks 1/)
+  assert.match(out, /⚠ reasoning-chunks \(1\) look like assistant stream content and are NOT in the verdict/)
+  assert.match(out, /over the 1 step\(s\) this tool could read/)
+})
+
+test('coverage stays quiet when the file is fully readable', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
+  ])
+  const { coverage } = run(file)
+  assert.equal(coverage.skipped, 0)
+  assert.equal(coverage.unparsable, 0)
+  assert.equal(coverage.verdictScopeIncomplete, false)
+  const out = runText(file)
+  assert.match(out, /coverage: \d+ line\(s\) — 1 parsed \(assistant\/attempt 1\), 0 skipped/)
+  assert.ok(!out.includes('⚠'), 'no warning without stream-shaped skips')
+})
+
+test('benign skipped types do not raise the stream-content warning', () => {
+  // Skipping conversation bookkeeping is normal; only names that claim to carry
+  // assistant stream content make the verdict's scope incomplete.
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
+    { type: 'user/message', seq: 1, time: 1, data: { turn: 0, step: 1 } },
+    { type: 'tool/result', seq: 2, time: 2, data: { turn: 0, step: 1 } },
+  ])
+  const { coverage } = run(file)
+  assert.equal(coverage.skipped, 2)
+  assert.equal(coverage.verdictScopeIncomplete, false)
+  assert.ok(!runText(file).includes('⚠'))
+})
+
+test('coverage counts records dropped INSIDE a parsed event, not just whole lines', () => {
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'future-record-kind', texts: [[0, STALLED]] },
+      { type: 'reasoning-chunks', time0: 1, texts: [[1, STALLED]] },
+    ] } },
+  ])
+  const { coverage } = run(file)
+  assert.equal(coverage.skipped, 0, 'the line itself was parsed')
+  assert.equal(coverage.unknownRecordTypes['future-record-kind'], 1)
+  const out = runText(file)
+  assert.match(out, /unrecognised inside parsed events: stream record future-record-kind ×1/)
+})
+
+test('analyzer reads the master tool-call-chunks shape, which keys args not texts', () => {
+  // 0.1.5/0.1.6 wrote `texts` for tool-call groups; current master writes `args`.
+  // Reading only `texts` dropped every tool-argument delta, which flipped
+  // `hasOutput` on a call whose only output was a tool call.
+  const args = ['{"path":"src/index.ts"', ',"line":42}']
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+      { type: 'tool-call-chunks', time0: 1, index: 0, id: 'c1', dt: [0, 1], args },
+    ] } },
+  ])
+  const { steps, coverage } = run(file)
+  assert.equal(steps[0].hasOutput, true, 'a tool call is output')
+  assert.equal(steps[0].textChars, args.join('').length)
+  assert.equal(coverage.unknownRecordTypes['tool-call-chunks'], undefined, 'recognised, not dropped')
+})
+
+test('an unreadable file says so instead of presenting an empty verdict', () => {
+  const file = writeSession([
+    { type: 'reasoning-chunks', time0: 0, index: 0, dt: [0], texts: ['flat dump'] },
+    { type: 'text-chunks', time0: 1, index: 0, dt: [0], texts: ['flat dump'] },
+  ])
+  const { steps, coverage } = run(file)
+  assert.deepEqual(steps, [])
+  assert.equal(coverage.verdictScopeIncomplete, true)
+  const out = runText(file)
+  assert.match(out, /no assistant steps found/)
+  assert.match(out, /check the skipped-type inventory above/)
+  assert.match(out, /skipped by type: reasoning-chunks 1, text-chunks 1/)
 })

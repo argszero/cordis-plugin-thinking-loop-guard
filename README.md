@@ -240,18 +240,37 @@ rule.
   `--threshold 2`, `--min-chars 512`, `--max-fires 4`,
   `--max-repeated-text 60`. `--json` emits the raw per-step records.
 - It reads **both** durable attempt formats: `assistant/chunk` (session format v1,
-  dsh ≤ 0.1.2-rc.1) and `assistant/attempt` (session format v2, dsh ≥ 0.1.5).
+  dsh ≤ 0.1.2-rc.1) and `assistant/attempt` (session format v2/v3, dsh ≥ 0.1.5).
   Those two names do not overlap, so a reader can only be format-specific — this
-  tool handles both.
+  tool handles both. Inside a compacted attempt it reads `text-chunks`,
+  `reasoning-chunks` and `tool-call-chunks` (the tool-call group keys its deltas
+  `args` on current master and `texts` on 0.1.5/0.1.6; both are read).
 - Unparseable lines and unknown record types are skipped rather than guessed at,
   so a future format addition degrades to "fewer steps observed", never a wrong
-  verdict.
+  verdict — **and every skip is reported**, because a zero you cannot distinguish
+  from "nothing was readable" is not a verdict:
+
+  ```text
+  stalled steps: 0/161  (over the 161 step(s) this tool could read — see coverage)
+  …
+  coverage: 41207 line(s) — 38902 parsed (assistant/chunk 38899, assistant/attempt 3), 2305 skipped
+    skipped by type: user/message 12, tool/result 40, reasoning-chunks 2200, (no type) 53
+    ⚠ reasoning-chunks (2200) look like assistant stream content and are NOT in the verdict —
+      it covers only the 161 step(s) above. If your file flattens stream records to top-level
+      lines, the tool cannot attribute them to a (turn, step); it reports them here instead of guessing.
+  ```
+
+  `--json` carries the same numbers under `coverage`, with
+  `verdictScopeIncomplete` as the machine-readable flag: **read `stalled` only
+  together with it.** An empty step list is reported the same way — it means the
+  two readable event types are absent, not that the session was healthy.
 - Your session file never leaves your machine; the tool only reads it.
 
 ## Version history
 
 | Version | Change |
 |---|---|
+| 0.1.9 | The analyzer now **discloses what it did not read**. Issue #1's follow-up: a reporter ran it on a flattened dump, got `stalled 0/161`, and had to establish by hand that the reasoning behind those turns sits in lines the tool never parses — a silent skip and an absent event printed the same zero. Every run now ends with a coverage block (lines parsed, skipped-by-type inventory, records dropped inside parsed events) plus a warning when a skipped type's name says it carries assistant stream content, `--json` carries `verdictScopeIncomplete`, and the `stalled` line states that it covers only the steps read. Also reads the `args` key that current master uses for `tool-call-chunks` (`texts` on 0.1.5/0.1.6): missing it dropped every tool-argument delta and flipped `hasOutput` on a call whose only output was a tool call. |
 | 0.1.8 | Adds the **cycle rule** (`maxRepeatedCycleChars`, default 64; `minRepeatedCycleChars`, default 256) for discussion [#7043](https://github.com/deepseek-ai/deepseek-harness/discussions/7043): a call bleeding a *cycle* of short lines no longer needs 60 byte-identical deltas to be cut. Measured, the previous version never fired on that shape under any chunking (longest identical run 2). Exact verbatim periodicity was chosen over a low-entropy ratio because the ratio only separates the loop from legitimately repetitive output by ~0.06. The breaker now logs which rule fired. |
 | 0.1.7 | Admits the **0.1.3-alpha.2 line and the whole 0.1.6 line**. The shipped range had gone stale: it refused the newest dsh release, so `npm install` failed with `ERESOLVE` for a plugin whose suite passes there. Every admitted line is now one the suite has been run against with all dsh peers pinned to it. `test/peer-range.spec.mjs` computes the admitted set with `semver` instead of pattern-matching the range string. |
 | 0.1.6 | Adds the **mid-stream breaker** (`maxRepeatedText`, default 60) for discussion [#2848](https://github.com/deepseek-ai/deepseek-harness/discussions/2848): one call repeating the same `text-delta` is now cut *inside* the call with a terminal `REPETITIVE_OUTPUT` finish, because the per-call detectors above cannot reach a call that never ends. The analyzer reports `repeatedRun`/`break`. |
@@ -265,8 +284,9 @@ rule.
 ## Compatibility
 
 - **Every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2**: works. All
-  eight lines below have had the full suite (52 tests) run against them with
-  every dsh peer pinned to that single line, and `tsc` is clean on all eight.
+  eight lines below have had the full suite run against them with every dsh peer
+  pinned to that single line (52 tests when that matrix was last run, at 0.1.7),
+  and `tsc` is clean on all eight.
 - The guard does **not** depend on the `agent/assistant-stream` event that
   arrived in 0.1.5-alpha.1. It wraps the older `llm/stream` waterfall, which
   every admitted line has — that is what makes the wide support possible.
