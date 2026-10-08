@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-thinking-loop-guard",
-  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects three per-call shapes (reasoning-only calls, restated-material calls, self-repeating low-entropy reasoning) and re-fires instead of latching; plus a mid-stream breaker that ends a single call repeating its visible output (maxRepeatedText for identical deltas, maxRepeatedCycleChars for a cycled few-line bleed), which no post-call detector can reach. Ships an offline session analyzer that replays a session jsonl through the same detector and reports its own parse coverage, so a zero over an unreadable file cannot be mistaken for health. Compatible with every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2.",
-  "version": "0.1.9",
+  "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects three per-call shapes (reasoning-only calls, restated-material calls, self-repeating low-entropy reasoning) and re-fires instead of latching; plus a mid-stream breaker that ends a single call repeating its visible output (maxRepeatedText for identical deltas, maxRepeatedCycleChars for a cycled few-line bleed), which no post-call detector can reach. Ships an offline session analyzer that replays a session jsonl through the same detector and reports its own parse coverage, so a zero over an unreadable file cannot be mistaken for health. Compatible with every published dsh line from 0.1.2-rc.1 through 0.2.0-rc.2 (each one run); writes its reactions under a producer-owned message source, because session format v4 refuses the retired bare `plugin` kind.",
+  "version": "0.1.10",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -42,16 +42,16 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0",
-    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
+    "@deepseek-ai/dsh-agent": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-agent": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "semver": "^7.8.5",
     "typescript": "^5.5.0"
   },
@@ -59,7 +59,8 @@
     "build": "tsc",
     "prepublishOnly": "tsc",
     "test": "node --test \"test/*.spec.mjs\"",
-    "analyze": "node tools/analyze-session.mjs"
+    "analyze": "node tools/analyze-session.mjs",
+    "test:probe-lines": "node scripts/probe-lines.mjs"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-agent": {

@@ -270,6 +270,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.1.10 | Fixes issue #2: the injected notices now carry a **producer-owned `source.kind`**. On session format v4 both injection paths — `agent.steer(...)`, which lands as `user/message`, and `agent.inject(...)`, which lands as `agent/inbox/spliced` — stamped `kind: 'plugin'`, a source kind v4 retired. The encoder refuses that *per row* and therefore refuses the whole turn (`format v4 message requires a producer-owned source kind`), so the guard whose job is to end a loop ended the turn instead, on the first notice it ever emitted. Both paths now stamp `kind: 'plugin:thinking-loop-guard'` — the same shape the v3→v4 migration rewrites historical rows into. `test/source-kind.spec.mjs` pins both paths (reverting the kind fails it). Also in this release: the peer range admits `0.1.7-alpha.1`, which had been excluded for an artifact of how the line was measured rather than anything about the line itself, and `npm run test:probe-lines` now re-measures every claimed line with **all** of that line's dsh peers pinned — pinning only the two packages this source imports let npm derive the other peers from newer builds, which is what made an earlier probe report three good lines as broken. |
 | 0.1.9 | The analyzer now **discloses what it did not read**. Issue #1's follow-up: a reporter ran it on a flattened dump, got `stalled 0/161`, and had to establish by hand that the reasoning behind those turns sits in lines the tool never parses — a silent skip and an absent event printed the same zero. Every run now ends with a coverage block (lines parsed, skipped-by-type inventory, records dropped inside parsed events) plus a warning when a skipped type's name says it carries assistant stream content, `--json` carries `verdictScopeIncomplete`, and the `stalled` line states that it covers only the steps read. Also reads the `args` key that current master uses for `tool-call-chunks` (`texts` on 0.1.5/0.1.6): missing it dropped every tool-argument delta and flipped `hasOutput` on a call whose only output was a tool call. |
 | 0.1.8 | Adds the **cycle rule** (`maxRepeatedCycleChars`, default 64; `minRepeatedCycleChars`, default 256) for discussion [#7043](https://github.com/deepseek-ai/deepseek-harness/discussions/7043): a call bleeding a *cycle* of short lines no longer needs 60 byte-identical deltas to be cut. Measured, the previous version never fired on that shape under any chunking (longest identical run 2). Exact verbatim periodicity was chosen over a low-entropy ratio because the ratio only separates the loop from legitimately repetitive output by ~0.06. The breaker now logs which rule fired. |
 | 0.1.7 | Admits the **0.1.3-alpha.2 line and the whole 0.1.6 line**. The shipped range had gone stale: it refused the newest dsh release, so `npm install` failed with `ERESOLVE` for a plugin whose suite passes there. Every admitted line is now one the suite has been run against with all dsh peers pinned to it. `test/peer-range.spec.mjs` computes the admitted set with `semver` instead of pattern-matching the range string. |
@@ -283,17 +284,25 @@ rule.
 
 ## Compatibility
 
-- **Every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2**: works. All
-  eight lines below have had the full suite run against them with every dsh peer
-  pinned to that single line (52 tests when that matrix was last run, at 0.1.7),
-  and `tsc` is clean on all eight.
+- **Every published dsh line from 0.1.2-rc.1 through 0.2.0-rc.2** — fifteen lines —
+  works: each has had the full suite run against it with **every** dsh package
+  pinned to that single line (74 tests, `tsc` clean). That matrix is not a table
+  kept by hand: `npm run test:probe-lines` installs each line into its own tree
+  and runs it, and `test/peer-lines.mjs` is the record both it and the range test
+  read.
+- **Every older prerelease gets a loud `ERESOLVE`** rather than a silent runtime
+  failure on a generation the guard was never exercised against. One published
+  line is in that group deliberately — `0.2.1-alpha.1`, where `dsh-llm` no longer
+  ships the stream-grammar invariant module our protocol-legality arm runs
+  against, so the suite would be testing less there without saying so. It is
+  measured, not skipped: the probe asserts that line still fails for that reason.
 - The guard does **not** depend on the `agent/assistant-stream` event that
   arrived in 0.1.5-alpha.1. It wraps the older `llm/stream` waterfall, which
   every admitted line has — that is what makes the wide support possible.
 - The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm`:
 
   ```
-  >=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0
+  >=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1
   ```
 
 ### Why the peer range looks like that
@@ -313,26 +322,27 @@ you have to avoid both:
 ">=0.1.2-rc.1 <0.2.0"
 
 // What we ship: one comparator per supported tuple line.
-">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
+">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1"
 ```
 
-The npm `latest` tag for `@deepseek-ai/dsh` is `0.1.2-rc.1`, while the `next` and
-`alpha` tags move through the `0.1.5` and `0.1.6` lines — several generations are
-in active use at once, so one comparator per live tuple is needed. v0.1.1 shipped
+Several generations are in active use at once — as of this release `@deepseek-ai/dsh`
+tags `latest` and `next` at `0.2.0-rc.2` and `alpha` at `0.2.1-alpha.1`, while the
+individual packages carry staler `latest` tags of their own (`dsh-agent` still
+says `0.1.0-rc.6`) — so one comparator per live tuple is needed. v0.1.1 shipped
 the first form and could not be installed at all (`ETARGET`); v0.1.2 shipped the
 second and rejected the `0.1.5` line (`ERESOLVE`); v0.1.6 shipped a union that had
 simply gone stale — it refused the `0.1.3-alpha.2` line and the whole `0.1.6`
 line, newest release included, for a plugin whose suite passes on both.
 
-The range deliberately admits **only** the lines this plugin is tested on. Its
-admitted set over every published dsh version is exactly `0.1.2-rc.1`,
-`0.1.3-alpha.2`, `0.1.5-alpha.1`, `0.1.5-alpha.2`, `0.1.5-rc.1`, `0.1.5-rc.2`,
-`0.1.6-alpha.1`, `0.1.6-alpha.2`; older prereleases (`0.1.0-rc.*`, `0.1.1-rc.*`,
-`0.1.2-alpha.*`) get a loud `ERESOLVE` rather than a silent runtime failure on a
-generation the guard has never been exercised against. Add a comparator for your
-line only after running the suite against it — `test/peer-range.spec.mjs`
-computes this set with `semver` and fails if the range and the tested set drift
-apart in either direction.
+The range deliberately admits **only** the lines this plugin is tested on: the
+fifteen listed in `test/peer-lines.mjs`, and nothing else among the published
+versions. Everything older (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`) and the
+one line excluded on measurement (`0.2.1-alpha.1`) gets a loud `ERESOLVE` rather
+than a silent runtime failure on a generation the guard has never been exercised
+against. Add a comparator for your line only after running the suite against it —
+`test/peer-range.spec.mjs` computes this set with `semver` and fails if the range
+and the tested set drift apart in either direction, and
+`npm run test:probe-lines` is what produces that set in the first place.
 
 ### Why `inject` is required
 
