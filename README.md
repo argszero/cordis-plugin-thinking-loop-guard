@@ -270,6 +270,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.1.11 | **Documentation only — no code change.** The README now documents the **v4 message-source trap** that issue #2 hit, because it is ecosystem-wide rather than specific to this plugin: a shared `{ kind: 'plugin' }` entry was still in `MessageSourceMap` through the 0.1.6 line, so a plugin built against an older line compiles clean and is refused *at write time* on a v4 session; and the two delivery paths (`steer` → `user/message`, `inject` → `agent/inbox/spliced`) are refused by different validators, so a test that covers one proves nothing about the other. Shipped as its own version rather than folded into 0.1.10 because 0.1.10 was already published and npm renders the package page from the published tarball. |
 | 0.1.10 | Fixes issue #2: the injected notices now carry a **producer-owned `source.kind`**. On session format v4 both injection paths — `agent.steer(...)`, which lands as `user/message`, and `agent.inject(...)`, which lands as `agent/inbox/spliced` — stamped `kind: 'plugin'`, a source kind v4 retired. The encoder refuses that *per row* and therefore refuses the whole turn (`format v4 message requires a producer-owned source kind`), so the guard whose job is to end a loop ended the turn instead, on the first notice it ever emitted. Both paths now stamp `kind: 'plugin:thinking-loop-guard'` — the same shape the v3→v4 migration rewrites historical rows into. `test/source-kind.spec.mjs` pins both paths (reverting the kind fails it). Also in this release: the peer range admits `0.1.7-alpha.1`, which had been excluded for an artifact of how the line was measured rather than anything about the line itself, and `npm run test:probe-lines` now re-measures every claimed line with **all** of that line's dsh peers pinned — pinning only the two packages this source imports let npm derive the other peers from newer builds, which is what made an earlier probe report three good lines as broken. |
 | 0.1.9 | The analyzer now **discloses what it did not read**. Issue #1's follow-up: a reporter ran it on a flattened dump, got `stalled 0/161`, and had to establish by hand that the reasoning behind those turns sits in lines the tool never parses — a silent skip and an absent event printed the same zero. Every run now ends with a coverage block (lines parsed, skipped-by-type inventory, records dropped inside parsed events) plus a warning when a skipped type's name says it carries assistant stream content, `--json` carries `verdictScopeIncomplete`, and the `stalled` line states that it covers only the steps read. Also reads the `args` key that current master uses for `tool-call-chunks` (`texts` on 0.1.5/0.1.6): missing it dropped every tool-argument delta and flipped `hasOutput` on a call whose only output was a tool call. |
 | 0.1.8 | Adds the **cycle rule** (`maxRepeatedCycleChars`, default 64; `minRepeatedCycleChars`, default 256) for discussion [#7043](https://github.com/deepseek-ai/deepseek-harness/discussions/7043): a call bleeding a *cycle* of short lines no longer needs 60 byte-identical deltas to be cut. Measured, the previous version never fired on that shape under any chunking (longest identical run 2). Exact verbatim periodicity was chosen over a low-entropy ratio because the ratio only separates the loop from legitimately repetitive output by ~0.06. The breaker now logs which rule fired. |
@@ -352,6 +353,45 @@ fiber did not declare, so the module exports `inject = ['agents']`. This is a
 **runtime** guard — TypeScript compiles `ctx.agents` fine whether or not it is
 declared, which is how v0.1.1 shipped crashing on activation (#1). If you fork
 this plugin and add another `ctx.<service>` read, declare it in `inject` too.
+
+### Why the reaction messages declare their own source kind (session format v4)
+
+Session format **v4** refuses a message whose source is the retired bare
+`kind: 'plugin'`, and it refuses it at write time — the whole turn fails with
+`format v4 message requires a producer-owned source kind`, and the notice that
+was supposed to end the loop takes the turn with it. If you are writing a plugin
+that injects or steers a message, that is the failure to design against, and it
+has two traps worth knowing before you meet them:
+
+- **Your build cannot see it.** `MessageSourceMap` is what the compiler checks
+  `kind` against, and through the 0.1.6 line it still carried a shared
+  `plugin: { kind: 'plugin', plugin: string }` entry. So the retired literal
+  type-checked against the line you happened to build on, while the v4 writer on
+  your user's line refused it. At runtime the check is a threshold rather than a
+  whitelist — any non-empty kind other than `'plugin'` is admitted — but the
+  compiler has no such threshold: `MessageSource` is the union of everything
+  declared in `MessageSourceMap`, so an undeclared kind does not compile, and
+  declaring your own entry is load-bearing rather than decoration.
+
+  ```ts
+  declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+      'plugin:your-plugin': { kind: 'plugin:your-plugin' } & ContextFormed
+    }
+  }
+  ```
+
+- **Both delivery paths are checked, by different validators.**
+  `agent.steer(...)` lands as a `user/message` row (`assertV4MessageSources`) and
+  `agent.inject(...)` lands inside `agent/inbox/spliced.inserted`
+  (`assertV4SourceRowAdmission`). A test that exercises one path proves nothing
+  about the other — this plugin's issue #2 was reported with both affected.
+
+Use the kind the harness's own V3→V4 migration derives for a released plugin name
+(`plugin:${plugin}`, `session-format-v3-to-v4/src/sources.ts`), so a message your
+plugin writes now and one migrated out of an older log of it carry the *same*
+attribution instead of drifting apart. v4 preserves unknown attribution, so a
+`plugin` field can stay beside `kind` and readers that match on it keep working.
 
 ## License
 
