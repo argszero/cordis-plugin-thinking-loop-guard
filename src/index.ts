@@ -132,7 +132,28 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, AgentCancelCause } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
-import type { LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
+
+/**
+ * This producer's own message source, declared where the harness expects it.
+ *
+ * `kind` is the producer identity, not a category: session format V4 refuses the
+ * retired bare `'plugin'` wrapper (`format v4 message requires a producer-owned
+ * source kind`, `session-format-v3-to-v4/src/message-sources.ts`), and
+ * `MessageSourceMap` has carried no shared catch-all entry since the 0.1.7 line.
+ * The value used here is the one the harness's own V3→V4 migration derives for a
+ * released plugin name (`plugin:${plugin}`, `session-format-v3-to-v4/src/sources.ts`),
+ * so a message this version writes natively and one migrated out of an older log
+ * of this plugin carry the *same* attribution instead of drifting apart.
+ *
+ * v4 preserves unknown attribution, so `plugin` stays alongside `kind`: readers
+ * that match on `source.plugin` keep working.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'plugin:thinking-loop-guard': { readonly kind: 'plugin:thinking-loop-guard'; readonly plugin: 'thinking-loop-guard' } & ContextFormed
+  }
+}
 
 type UserMessage = ReturnType<typeof createUserMessage>
 
@@ -267,7 +288,7 @@ export const name = 'thinking-loop-guard'
  */
 export const inject = ['agents']
 
-const PLUGIN_SOURCE = { kind: 'plugin', plugin: 'thinking-loop-guard' } as const
+const PLUGIN_SOURCE = { kind: 'plugin:thinking-loop-guard', plugin: 'thinking-loop-guard' } as const
 
 function message(text: string, form: 'notice'): UserMessage {
   return createUserMessage({
