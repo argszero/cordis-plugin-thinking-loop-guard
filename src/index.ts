@@ -124,6 +124,11 @@
  *  - `options.sessionId` → `ctx.agents.get(sessionId)` yields the live `Agent`.
  *  - `agent.steer(message)`, `agent.inject(message)`, and `agent.cancel(cause)`
  *    are public methods; a listener can react but not veto an in-flight step.
+ *  - `agent.cancel` takes the **closed** `AgentCancelCause` union. Anything else
+ *    (a bare string, a custom `kind`) makes the loop's `abortedCancelCause`
+ *    `assertNever` throw inside the turn's `catch`, which leaves `turnEnds` null
+ *    and writes `turn/end` with `reason: null` — a record that blanks the whole
+ *    client session list (#8832, #9156). See `cancelCauseFor`.
  *
  * @module @argszero/cordis-plugin-thinking-loop-guard
  */
@@ -198,7 +203,17 @@ export interface Config {
    * default allows several. Default `4`.
    */
   maxFires?: number
-  /** Cancel cause used when `escalate` is `cancel`. Default `'thinking-loop'`. */
+  /**
+   * Cause **reason** used when `escalate` is `cancel`. Default `'thinking-loop'`.
+   *
+   * It is the `reason` of the closed union's `hook` member, not a bare cause:
+   * the emitted value is `{ kind: 'hook', reason: <this string> }` and the
+   * persisted turn ending is
+   * `{ kind: 'aborted', reason: { kind: 'hook', reason: <this string> } }`.
+   * A bare string would be outside `AgentCancelCause`, and the loop turns that
+   * into `turn/end` with `reason: null`, which blanks the client's session list
+   * (#8832, #9156). See {@link cancelCauseFor}.
+   */
   cancelCause?: string
   /**
    * Consecutive identical normalized visible-output chunks that end the stream
@@ -271,6 +286,35 @@ export const Config: z<Config> = z.object({
 })
 
 export const name = 'thinking-loop-guard'
+
+/**
+ * The cancellation cause this guard hands to `agent.cancel()`.
+ *
+ * `AgentCancelCause` is a **closed** union — `user` / `parent` / `disposed` /
+ * `hook` (`packages/core/session/src/types.ts`) — and `hook` is the member a
+ * plugin owns. The object matters, not the string: the loop reads the cause back
+ * with `abortedCancelCause(signal)` (`packages/core/agent-loop/src/agent.ts`),
+ * whose last branch is `default: return assertNever(cause)`. Handing it anything
+ * whose `kind` is outside the union throws **inside the turn's `catch`**, so the
+ * `turnEnds = { kind: 'aborted', reason: cause }` assignment never runs, the
+ * `let turnEnds = null` initializer survives, and the `finally` writes
+ * `turn/end` with `reason: null`. `Session.append` does not check that field
+ * (`validateSessionEventData` covers surface messages, `request/header` and
+ * `tool/result` only), so the null reaches the log — and a single null reason is
+ * enough to make the client's turn rendering throw and blank **every** session
+ * in the list (discussions #8832, #9156). Core writes the same shape itself:
+ * `{ kind: 'hook', reason: 'deepseek-account/signed-out' }`.
+ *
+ * The configured string is the cause's `reason`, not its `kind`, so the config
+ * surface is unchanged: `cancelCause: 'x'` reads back as
+ * `{ kind: 'aborted', reason: { kind: 'hook', reason: 'x' } }`.
+ *
+ * @param config - the resolved configuration; only `cancelCause` is read.
+ * @returns a cause the loop's closed-union switch returns instead of throwing.
+ */
+export function cancelCauseFor(config: Pick<ResolvedConfig, 'cancelCause'>): AgentCancelCause {
+  return { kind: 'hook', reason: config.cancelCause }
+}
 
 /**
  * Cordis services this plugin resolves off the Context.
@@ -672,7 +716,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         agent.steer(message(reactionMessage('steer', reason), 'notice'))
         return
       case 'cancel':
-        agent.cancel(config.cancelCause as unknown as AgentCancelCause)
+        agent.cancel(cancelCauseFor(config))
         return
     }
   }

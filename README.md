@@ -59,6 +59,14 @@ low-entropy repetition, i.e. `repeatRatio`), it escalates:
 the live `Agent`. A listener can react but cannot veto/rewrite an in-flight step;
 steer and cancel are sufficient to break the loop.
 
+`agent.cancel()` takes the **closed** `AgentCancelCause` union (`user` / `parent`
+/ `disposed` / `hook`) and this plugin hands it the `hook` member it owns —
+`{ kind: 'hook', reason: <cancelCause> }` — so the persisted turn ending reads
+`{ kind: 'aborted', reason: { kind: 'hook', reason: 'thinking-loop' } }`. The
+configured `cancelCause` string is the member's `reason`, not a bare cause, and
+the config surface is unchanged by that. See [Notes](#notes) for why the object
+matters.
+
 ## Single-call repetition (`maxRepeatedText`)
 
 Everything above is judged **after a call ends** — which is structurally too late
@@ -174,7 +182,7 @@ interface Config {
   escalate?: 'warn' | 'steer' | 'cancel'
   /** How many times one agent may be reacted to before the guard stops re-firing. Default 4. */
   maxFires?: number
-  /** Cancel cause when escalate is 'cancel'. Default 'thinking-loop'. */
+  /** Cancel cause *reason* when escalate is 'cancel'. Default 'thinking-loop'. */
   cancelCause?: string
   /** Consecutive identical visible-output chunks that end the stream mid-call. 0 disables. Default 60. */
   maxRepeatedText?: number
@@ -207,6 +215,17 @@ interface Config {
 - Both content checks are cheap O(n) heuristics over fixed-length grams
   (language-agnostic, so CJK with no whitespace works) and run only once a call is
   already long, so cost is bounded.
+- **The cancel cause must be a union member.** `AgentCancelCause` is closed
+  (`packages/core/session/src/types.ts`), and the loop reads the abort signal back
+  with `abortedCancelCause()` (`packages/core/agent-loop/src/agent.ts`), whose last
+  branch is `default: return assertNever(cause)`. Handing it a bare string throws
+  **inside the turn's `catch`**, so the `turnEnds` assignment never runs and the
+  `finally` writes `turn/end` with `reason: null`. Nothing on the write path
+  checks that field, so the null reaches the log — and one null reason is enough to
+  make the client's turn rendering throw and blank **every** session in the list
+  (discussions #8832, #9156). This plugin emits the `hook` member it owns;
+  `test/cancel-cause.spec.mjs` pins the emitted object, the persisted ending, and
+  the bare-string control that still reproduces `{"reason":null}`.
 
 ## Analyzing a session offline (`tools/analyze-session.mjs`)
 
@@ -270,6 +289,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.1.12 | **Fixes a `turn/end` corruption this plugin was producing.** `escalate: 'cancel'` handed `agent.cancel()` a bare string cast to `AgentCancelCause`, a union core treats as closed (`user` / `parent` / `disposed` / `hook`). The loop reads the abort signal back with `abortedCancelCause()`, whose last branch is `default: return assertNever(cause)` — so the out-of-union cause threw **inside the turn's `catch`**, `turnEnds` stayed `null`, and the `finally` appended `{ turn, reason: null }`. The write path does not check that field, so the null reached the log; one such record makes the client's turn rendering throw and blanks the entire session list (discussions [#8832](https://github.com/deepseek-ai/deepseek-harness/discussions/8832), [#9156](https://github.com/deepseek-ai/deepseek-harness/discussions/9156)). The guard now emits the `hook` member it owns — `{ kind: 'hook', reason: <cancelCause> }` — the same shape core writes for `deepseek-account/signed-out`; the persisted ending is `{ kind: 'aborted', reason: { kind: 'hook', reason: 'thinking-loop' } }`. The config surface is unchanged (`cancelCause` is still the string, now read as the member's `reason`). `test/cancel-cause.spec.mjs` pins the emitted object, the round-trip, and the bare-string control that still reproduces `{"reason":null}`; `scripts/witness-cancel-cause.mjs` proves the boundary across published lines (`0.1.6-alpha.2` has no `abortedCancelCause`; `0.1.7-rc.2` and `0.2.0-rc.2` do, and both now end the turn with a *readable* reason). |
 | 0.1.11 | **Documentation only — no code change.** The README now documents the **v4 message-source trap** that issue #2 hit, because it is ecosystem-wide rather than specific to this plugin: a shared `{ kind: 'plugin' }` entry was still in `MessageSourceMap` through the 0.1.6 line, so a plugin built against an older line compiles clean and is refused *at write time* on a v4 session; and the two delivery paths (`steer` → `user/message`, `inject` → `agent/inbox/spliced`) are refused by different validators, so a test that covers one proves nothing about the other. Shipped as its own version rather than folded into 0.1.10 because 0.1.10 was already published and npm renders the package page from the published tarball. |
 | 0.1.10 | Fixes issue #2: the injected notices now carry a **producer-owned `source.kind`**. On session format v4 both injection paths — `agent.steer(...)`, which lands as `user/message`, and `agent.inject(...)`, which lands as `agent/inbox/spliced` — stamped `kind: 'plugin'`, a source kind v4 retired. The encoder refuses that *per row* and therefore refuses the whole turn (`format v4 message requires a producer-owned source kind`), so the guard whose job is to end a loop ended the turn instead, on the first notice it ever emitted. Both paths now stamp `kind: 'plugin:thinking-loop-guard'` — the same shape the v3→v4 migration rewrites historical rows into. `test/source-kind.spec.mjs` pins both paths (reverting the kind fails it). Also in this release: the peer range admits `0.1.7-alpha.1`, which had been excluded for an artifact of how the line was measured rather than anything about the line itself, and `npm run test:probe-lines` now re-measures every claimed line with **all** of that line's dsh peers pinned — pinning only the two packages this source imports let npm derive the other peers from newer builds, which is what made an earlier probe report three good lines as broken. |
 | 0.1.9 | The analyzer now **discloses what it did not read**. Issue #1's follow-up: a reporter ran it on a flattened dump, got `stalled 0/161`, and had to establish by hand that the reasoning behind those turns sits in lines the tool never parses — a silent skip and an absent event printed the same zero. Every run now ends with a coverage block (lines parsed, skipped-by-type inventory, records dropped inside parsed events) plus a warning when a skipped type's name says it carries assistant stream content, `--json` carries `verdictScopeIncomplete`, and the `stalled` line states that it covers only the steps read. Also reads the `args` key that current master uses for `tool-call-chunks` (`texts` on 0.1.5/0.1.6): missing it dropped every tool-argument delta and flipped `hasOutput` on a call whose only output was a tool call. |
@@ -287,7 +307,7 @@ rule.
 
 - **Every published dsh line from 0.1.2-rc.1 through 0.2.0-rc.2** — fifteen lines —
   works: each has had the full suite run against it with **every** dsh package
-  pinned to that single line (74 tests, `tsc` clean). That matrix is not a table
+  pinned to that single line (79 tests, `tsc` clean). That matrix is not a table
   kept by hand: `npm run test:probe-lines` installs each line into its own tree
   and runs it, and `test/peer-lines.mjs` is the record both it and the range test
   read.
