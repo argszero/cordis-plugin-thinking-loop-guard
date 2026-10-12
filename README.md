@@ -15,6 +15,13 @@ high reasoning effort can settle into:
 3. **self-repeating reasoning** — a single step whose own text is a low-entropy
    repetition ("好。执行。好。执行。").
 
+Two further shapes never reach a call boundary at all — a call that bleeds for
+minutes without ending, in the visible output or in its thinking — so they are cut
+**from inside the stream** instead of judged after it; see [single-call
+repetition](#single-call-repetition-maxrepeatedtext), [cycled
+repetition](#cycled-repetition-maxrepeatedcyclechars) and [reasoning-channel
+repetition](#reasoning-channel-repetition-maxrepeatedreasoningcyclechars).
+
 ## The gap it closes
 
 The in-tree `guard/` family watches two failure modes, both **tool-call-centric**:
@@ -154,6 +161,69 @@ Both rules share one breaker and report which one fired in the log line
 disables the cycle rule alone; `maxRepeatedText: 0` disables the chunk rule
 alone.
 
+## Reasoning-channel repetition (`maxRepeatedReasoningCycleChars`)
+
+Both rules above watch the call's **visible output**, and this plugin's per-call
+detector is documented as deliberately blind to reasoning, which revisits itself
+legitimately. The next report is the failure that blindness costs:
+
+> [discussion #9524](https://github.com/deepseek-ai/deepseek-harness/discussions/9524)
+> — `deepseek-vision` channel, flash-tier model, thinking in Chinese: the
+> thinking block degenerates into self-replication of the **shortest standalone
+> sentence** — `好。好。好。`, or `Go. Go. Go.` at an action point — measured at a
+> **longest repeated fragment run of 7298**, ~99% of one block being a single
+> repeated character, the reply swallowed and the session unusable. The same
+> environment, same language, with a pro-tier model: no degradation at all.
+
+Nothing in v0.1.x could act on it, and that is structural rather than a missed
+threshold:
+
+- the visible-output breaker never receives a `reasoning-delta` at all;
+- the per-call detector *does* read reasoning (`repeatRatio`), but only **after**
+  the call has ended — and then needs `maxThinkingSteps` consecutive stalled
+  calls before it reacts.
+
+That is inverted for a block that is 99% one character: the worst call of the
+session is the call nothing can interrupt, and by the time the post-call rule
+reads it the call has already spent its whole output budget.
+
+`maxRepeatedReasoningCycleChars` (default `64`) runs the **same periodic-tail
+scan** on the reasoning channel, in a sibling detector that ends the stream with
+the same terminal `REPETITIVE_OUTPUT` finish and the same pre-queued correction.
+It differs from the visible rule in exactly **one** dimension:
+
+- **A one-character period is admitted when the repeated character is content**
+  (a letter or a digit). The visible rule refuses period 1 to spare `=====` and
+  `─────` divider lines — and that exemption is exactly wrong here, because the
+  reported mechanism collapses onto the *shortest* unit: excluding period 1 by
+  inheritance would leave the decisive case (a single character repeated
+  thousands of times) uncatchable while the rule *appeared* to cover the
+  channel. A run of punctuation or whitespace is still read as layout, so a
+  divider in a thinking block is not truncated; the mirror-image miss is stated
+  rather than papered over — a bleed of a *purely* punctuation character (a
+  one-character period of `。`) is not caught, and the reported mechanism always
+  produces a unit containing a word.
+
+Every other threshold is deliberately shared (`minRepeatedReasoningCycleChars`
+defaults to the same `256`, and the period ceiling to the same `64`), so the
+difference between the two channels is one concept a reader can check rather
+than a second table of tuned constants. The two channels are separately
+configurable and separately disableable.
+
+Why the span minimum is `256`: anchored on the reporter's own measurements. The
+reported bleeds are `Go. ` × 238 (≈950 characters) and a single-character run of
+LRS 7298, while the same reporter's clean sessions measure LRS 1–2 — so 256
+characters of an exact period fires inside every reported bleed and sits far
+above the healthy readings. Measured on the guard itself, the reported shapes are
+cut after ~256 characters, where the severe one had already emitted thousands of
+the same unit.
+
+What it is not: **a guard, not a fix.** It ends the degenerate call and steers
+the resumed turn; it does not make a model stop being prone to collapse. That a
+pro-tier model does not degrade in the same environment says the propensity is
+model- and tier-side, which is why this plugin deliberately offers no fallback
+model and no automatic retry.
+
 ## Install
 
 Load it as an `@deepseek-ai/cordis` plugin in your `dsh` profile, or mount the
@@ -190,6 +260,10 @@ interface Config {
   maxRepeatedCycleChars?: number
   /** Shortest tail span that must be an exact repetition of one period before the cycle rule fires. Default 256. */
   minRepeatedCycleChars?: number
+  /** Longest repeating period of the call's REASONING, in characters, that ends the stream mid-call. 0 disables. Default 64. */
+  maxRepeatedReasoningCycleChars?: number
+  /** Shortest reasoning tail span that must be an exact repetition of one period before the reasoning rule fires. Default 256. */
+  minRepeatedReasoningCycleChars?: number
   /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
   breakCode?: string
   /** Steer the agent after a mid-stream break so the resumed turn is corrected. Default true. */
@@ -240,24 +314,29 @@ node node_modules/@argszero/cordis-plugin-thinking-loop-guard/tools/analyze-sess
 ```
 
 ```text
-  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  break
-   1  0/0                  33          0       1  reasoning-only
-   2  0/1                  33          3       1  repeated-material   repeated-material   1
+  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  reasonCycle  break
+   1  0/0                  33          0       1  reasoning-only                       0          0            0
+   2  0/1                  33          3       1  repeated-material   repeated-material   1          0            0
 
 stalled steps: 2/2  |  reactions: 1  |  steps that emitted text: 1
-intra-call repetition: 0 call(s) would be cut mid-stream (maxRepeatedText = 60)
+intra-call repetition: 0 call(s) would be cut mid-stream (0 by identical chunks, maxRepeatedText = 60; 0 by a repeating cycle in the visible output, ...; 0 by a repeating cycle in the reasoning, ...)
 ```
 
-The `repeatedRun` / `break` columns describe the [single-call
-case](#single-call-repetition-maxrepeatedtext). Replayed against a session shaped
-like discussion #2848 — one call streaming 2825 identical text chunks — the tool
-reports `repeatedRun 2825 / BREAK` **while the cross-call verdict stays
-`progress`**, which is the point: that failure is invisible to every per-call
-rule.
+The `repeatedRun` / `cycleSpan` / `reasonCycle` / `break` columns describe the
+intra-call rules: [identical deltas](#single-call-repetition-maxrepeatedtext),
+[cycled visible output](#cycled-repetition-maxrepeatedcyclechars) and [cycled
+reasoning](#reasoning-channel-repetition-maxrepeatedreasoningcyclechars). Every
+rule the plugin ships is answered here in the same release, because a rule the
+plugin has and the tool does not would make the tool quietly wrong about the very
+sessions it is run on. Replayed against a session shaped like discussion #2848 —
+one call streaming 2825 identical text chunks — the tool reports `repeatedRun
+2825 / BREAK` **while the cross-call verdict stays `progress`**, which is the
+point: that failure is invisible to every per-call rule.
 
 - Override the detector knobs to match your profile: `--similarity 0.6`,
   `--threshold 2`, `--min-chars 512`, `--max-fires 4`,
-  `--max-repeated-text 60`. `--json` emits the raw per-step records.
+  `--max-repeated-text 60`, `--max-repeated-cycle 64`,
+  `--max-repeated-reasoning-cycle 64`. `--json` emits the raw per-step records.
 - It reads **both** durable attempt formats: `assistant/chunk` (session format v1,
   dsh ≤ 0.1.2-rc.1) and `assistant/attempt` (session format v2/v3, dsh ≥ 0.1.5).
   Those two names do not overlap, so a reader can only be format-specific — this
@@ -289,6 +368,7 @@ rule.
 
 | Version | Change |
 |---|---|
+| 0.2.0 | Adds the **reasoning-channel breaker** (`maxRepeatedReasoningCycleChars`, default 64; `minRepeatedReasoningCycleChars`, default 256) for discussion [#9524](https://github.com/deepseek-ai/deepseek-harness/discussions/9524): a call whose **thinking** collapses onto the shortest standalone sentence (`好。好。好。`, `Go. Go. Go.`) is now cut mid-call, which no shipped rule could do — the visible-output breaker never receives a `reasoning-delta`, and the per-call detector only reads reasoning after the call has ended and then needs three consecutive stalled calls. Same algorithm and same span/period thresholds as the visible cycle rule, in a sibling detector, with one deliberate difference: a **one-character period is admitted when the repeated character is content**, because the reported mechanism collapses onto the *shortest* unit and the output rule's divider exemption would have left the decisive single-character case uncatchable. The miss that symmetry buys (a purely punctuation bleed) is documented rather than papered over. The analyzer gains the matching `reasoningCycleSpan` column in the same release, because a rule the plugin ships and the tool does not answer for would make the tool quietly wrong about the sessions it is run on. `test/reasoning-breaker.spec.mjs` covers the primitive, the period-1 decision, the false-positive controls, the `apply()` cut through the shipped `llm/invariant` (with a **reasoning** block still open), and the independent off switches. |
 | 0.1.12 | **Fixes a `turn/end` corruption this plugin was producing.** `escalate: 'cancel'` handed `agent.cancel()` a bare string cast to `AgentCancelCause`, a union core treats as closed (`user` / `parent` / `disposed` / `hook`). The loop reads the abort signal back with `abortedCancelCause()`, whose last branch is `default: return assertNever(cause)` — so the out-of-union cause threw **inside the turn's `catch`**, `turnEnds` stayed `null`, and the `finally` appended `{ turn, reason: null }`. The write path does not check that field, so the null reached the log; one such record makes the client's turn rendering throw and blanks the entire session list (discussions [#8832](https://github.com/deepseek-ai/deepseek-harness/discussions/8832), [#9156](https://github.com/deepseek-ai/deepseek-harness/discussions/9156)). The guard now emits the `hook` member it owns — `{ kind: 'hook', reason: <cancelCause> }` — the same shape core writes for `deepseek-account/signed-out`; the persisted ending is `{ kind: 'aborted', reason: { kind: 'hook', reason: 'thinking-loop' } }`. The config surface is unchanged (`cancelCause` is still the string, now read as the member's `reason`). `test/cancel-cause.spec.mjs` pins the emitted object, the round-trip, and the bare-string control that still reproduces `{"reason":null}`; `scripts/witness-cancel-cause.mjs` proves the boundary across published lines (`0.1.6-alpha.2` has no `abortedCancelCause`; `0.1.7-rc.2` and `0.2.0-rc.2` do, and both now end the turn with a *readable* reason). |
 | 0.1.11 | **Documentation only — no code change.** The README now documents the **v4 message-source trap** that issue #2 hit, because it is ecosystem-wide rather than specific to this plugin: a shared `{ kind: 'plugin' }` entry was still in `MessageSourceMap` through the 0.1.6 line, so a plugin built against an older line compiles clean and is refused *at write time* on a v4 session; and the two delivery paths (`steer` → `user/message`, `inject` → `agent/inbox/spliced`) are refused by different validators, so a test that covers one proves nothing about the other. Shipped as its own version rather than folded into 0.1.10 because 0.1.10 was already published and npm renders the package page from the published tarball. |
 | 0.1.10 | Fixes issue #2: the injected notices now carry a **producer-owned `source.kind`**. On session format v4 both injection paths — `agent.steer(...)`, which lands as `user/message`, and `agent.inject(...)`, which lands as `agent/inbox/spliced` — stamped `kind: 'plugin'`, a source kind v4 retired. The encoder refuses that *per row* and therefore refuses the whole turn (`format v4 message requires a producer-owned source kind`), so the guard whose job is to end a loop ended the turn instead, on the first notice it ever emitted. Both paths now stamp `kind: 'plugin:thinking-loop-guard'` — the same shape the v3→v4 migration rewrites historical rows into. `test/source-kind.spec.mjs` pins both paths (reverting the kind fails it). Also in this release: the peer range admits `0.1.7-alpha.1`, which had been excluded for an artifact of how the line was measured rather than anything about the line itself, and `npm run test:probe-lines` now re-measures every claimed line with **all** of that line's dsh peers pinned — pinning only the two packages this source imports let npm derive the other peers from newer builds, which is what made an earlier probe report three good lines as broken. |

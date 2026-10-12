@@ -105,6 +105,30 @@
  * 0.06 is not a margin worth truncating a user's call over; verbatim
  * periodicity is 0 for every one of those samples.
  *
+ * ## Reasoning-channel repetition (discussion #9524, v0.2.0)
+ *
+ * Both rules above watch the call's **visible output**, and the plugin's own
+ * detector is documented as deliberately blind to reasoning, which revisits
+ * itself legitimately. #9524 is the failure that blindness costs: under the
+ * `deepseek-vision` channel with a flash-tier model thinking in Chinese, the
+ * thinking block degenerates into self-replication of the shortest standalone
+ * sentence — `好。好。好。`, `Go. Go. Go.` — measured at a longest repeated
+ * fragment run of 7298, the reply swallowed and the session unusable; the same
+ * environment with a pro-tier model does not degrade at all.
+ *
+ * Nothing in v0.1.x could act on it. The visible-output breaker never receives a
+ * reasoning delta; the post-call judgement above reads reasoning but only once
+ * the call has finished spending its whole budget, and then needs three
+ * consecutive stalled calls. An inverted shape: the worst call of the session is
+ * the one nothing can interrupt. `maxRepeatedReasoningCycleChars` /
+ * `minRepeatedReasoningCycleChars` therefore run the same periodic-tail scan on
+ * the reasoning channel, in a sibling detector, with one deliberate difference
+ * (see {@link trailingReasoningCycle}): a **one-character period is admitted
+ * when the repeated character is content**. Reasoning collapses onto a word, not
+ * onto a divider, and the output rule's divider exemption would have left the
+ * decisive case — a single character repeated thousands of times — uncatchable.
+ * Every other threshold is shared, so the two channels differ in one concept.
+ *
  * ## Reaction
  *
  * On a threshold crossing it applies `escalate`. Unlike v0.1.2 it does **not**
@@ -250,6 +274,32 @@ export interface Config {
    */
   minRepeatedCycleChars?: number
   /**
+   * Longest repeating period, in **reasoning** characters, that
+   * {@link trailingReasoningCycle} will recognize at the tail of a call's
+   * thinking. `0` disables the reasoning rule. Default `64`.
+   *
+   * Same rule and same two thresholds as the visible-output cycle above — the
+   * channels differ in exactly one dimension, the **one-character period** the
+   * divider guard excludes there (see {@link trailingReasoningCycle}). Keeping
+   * every other number shared is deliberate: the diff between the two channels is
+   * then one concept a reader can check, not a second table of tuned constants.
+   */
+  maxRepeatedReasoningCycleChars?: number
+  /**
+   * Shortest tail span that must be an exact repetition of one period before the
+   * reasoning rule ends the stream. Default `256`, the same span the visible
+   * cycle rule uses.
+   *
+   * Anchored on discussion #9524's own measurements rather than on taste. The
+   * reported bleeds are `Go. ` × 238 (≈950 characters of a 4-character unit) and,
+   * in the severe case, a single-character run of LRS 7298; the same reporter's
+   * clean sessions measure LRS 1–2. 256 characters of an exact period therefore
+   * fires inside every reported bleed and sits far above the healthy
+   * measurements — the same margin the visible-output rule was given, which is
+   * why the two defaults are equal.
+   */
+  minRepeatedReasoningCycleChars?: number
+  /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
    *
@@ -281,6 +331,8 @@ export const Config: z<Config> = z.object({
   maxRepeatedText: z.number().step(1).min(0).default(60),
   maxRepeatedCycleChars: z.number().step(1).min(0).default(64),
   minRepeatedCycleChars: z.number().step(1).min(2).default(256),
+  maxRepeatedReasoningCycleChars: z.number().step(1).min(0).default(64),
+  minRepeatedReasoningCycleChars: z.number().step(1).min(2).default(256),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
 })
@@ -551,6 +603,59 @@ export function countRepeatedText(texts: readonly string[]): number {
 }
 
 /**
+ * Whether one repeated character is content rather than layout.
+ *
+ * A letter or a digit repeated for hundreds of characters is a model stuck on
+ * one token; the characters a divider is drawn with (`=`, `-`, `─`, whitespace,
+ * punctuation) are not. This is the whole of the reasoning channel's deviation
+ * from the visible-output rule — see {@link trailingReasoningCycle}.
+ */
+const CONTENT_CHAR = /[\p{L}\p{N}]/u
+
+/**
+ * Which rules the mid-stream breaker ships, as reported in the log line.
+ *
+ * JSDoc'd rather than left inline because the analyzer and the tests switch on
+ * the same three strings.
+ */
+export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'repeating-reasoning'
+
+/**
+ * The tail span that is an exact repetition of one period `admits` accepts, or
+ * `0` when the tail is not periodic.
+ *
+ * The scan stops as soon as the minimum is met, so the returned span is
+ * `max(minSpan, 2 * period)` rather than the longest periodic tail that exists:
+ * both callers only distinguish zero from non-zero, and stopping early keeps the
+ * rule bounded on a call that bleeds for hundreds of thousands of characters.
+ * Cost per check is `O(maxPeriod * minSpan)`.
+ *
+ * @param text - the accumulated text of one call's channel.
+ * @param maxPeriod - the longest period to consider, in characters.
+ * @param minSpan - the shortest qualifying tail span, in characters.
+ * @param admits - whether a candidate period (as its template text) may qualify.
+ * @returns the qualifying span in characters (`>= minSpan`), or `0`.
+ */
+function periodicTail(
+  text: string,
+  maxPeriod: number,
+  minSpan: number,
+  admits: (template: string) => boolean,
+): number {
+  if (maxPeriod < 1) return 0
+  for (let period = 1; period <= maxPeriod; period++) {
+    const template = text.slice(text.length - period)
+    if (!admits(template)) continue
+    const need = Math.max(minSpan, 2 * period) - period
+    const limit = Math.min(text.length - period, need)
+    let matched = 0
+    while (matched < limit && text[text.length - period - 1 - matched] === text[text.length - 1 - matched]) matched++
+    if (matched >= need) return matched + period
+  }
+  return 0
+}
+
+/**
  * The tail span that is an exact repetition of one short period, or `0` when the
  * tail is not periodic (discussion #7043).
  *
@@ -570,30 +675,49 @@ export function countRepeatedText(texts: readonly string[]): number {
  *    legitimate divider, and a one-character period would flag every long rule
  *    line in a generated document.
  *
- * The scan stops as soon as the minimum is met, so the returned span is
- * `max(minSpan, 2 * period)` rather than the longest periodic tail that exists:
- * the caller only distinguishes zero from non-zero, and stopping early keeps the
- * rule bounded on a call that bleeds for hundreds of thousands of characters.
- *
  * @param text - the accumulated visible output of one call.
  * @param maxPeriod - the longest period to consider, in characters.
  * @param minSpan - the shortest qualifying tail span, in characters.
  * @returns the qualifying span in characters (`>= minSpan`), or `0`.
  */
 export function trailingCycle(text: string, maxPeriod: number, minSpan: number): number {
-  if (maxPeriod < 1) return 0
-  for (let period = 1; period <= maxPeriod; period++) {
-    // The last `period` characters are the template; walk backwards while the
-    // output still matches itself one period earlier.
-    const template = text.slice(text.length - period)
-    if (new Set(template).size < 2) continue
-    const need = Math.max(minSpan, 2 * period) - period
-    const limit = Math.min(text.length - period, need)
-    let matched = 0
-    while (matched < limit && text[text.length - period - 1 - matched] === text[text.length - 1 - matched]) matched++
-    if (matched >= need) return matched + period
-  }
-  return 0
+  return periodicTail(text, maxPeriod, minSpan, template => new Set(template).size >= 2)
+}
+
+/**
+ * The tail span that is an exact repetition of one short period **in the
+ * reasoning channel**, or `0` (discussion #9524).
+ *
+ * Same algorithm and same two thresholds as {@link trailingCycle}; one gate
+ * differs, and that gate is the whole reason this is a second function.
+ *
+ * The output rule refuses a one-character period, because a run of `=` or `─`
+ * is a legitimate rule line in a generated document. That exemption is exactly
+ * wrong for reasoning: #9524's mechanism is the model collapsing onto the
+ * **shortest standalone unit** and emitting nothing else, so the reported period
+ * is 1–2 characters — and the decisive case is a *single* character repeated
+ * thousands of times. Excluding period 1 by inheritance would leave the worst
+ * measured failure uncatchable while the rule appeared to cover the channel.
+ *
+ * So period 1 is admitted here **when the repeated character is content** — a
+ * letter or a digit ({@link CONTENT_CHAR}). A stuck model repeats a unit that
+ * means something; 256 characters of punctuation or whitespace is layout, and
+ * this rule does not get to truncate a call over a divider. The known miss is
+ * the mirror image and is stated rather than papered over: a bleed of a purely
+ * punctuation character (a one-character period of `。`) is not caught. The
+ * reported mechanism requires the unit to be a *sentence*, so it always contains
+ * a word character — and any period of two or more characters, `好。` included,
+ * is caught by the shared rule with no exemption at all.
+ *
+ * @param text - the call's accumulated reasoning text.
+ * @param maxPeriod - the longest period to consider, in characters.
+ * @param minSpan - the shortest qualifying tail span, in characters.
+ * @returns the qualifying span in characters (`>= minSpan`), or `0`.
+ */
+export function trailingReasoningCycle(text: string, maxPeriod: number, minSpan: number): number {
+  return periodicTail(text, maxPeriod, minSpan, template => template.length === 1
+    ? CONTENT_CHAR.test(template)
+    : new Set(template).size >= 2)
 }
 
 /**
@@ -602,17 +726,19 @@ export function trailingCycle(text: string, maxPeriod: number, minSpan: number):
  *
  * Kept separate from {@link LoopDetector} because the two answer different
  * questions on different clocks — this one must decide *while the stream is
- * still open* (a call that bleeds for ten minutes never reaches the other), and
- * it is deliberately blind to reasoning text, which legitimately revisits itself.
- * Free of Cordis types so the decision rule is unit-testable without a harness.
+ * still open* (a call that bleeds for ten minutes never reaches the other) — and
+ * it watches **visible output only**, which is the channel its two rules were
+ * calibrated on. Reasoning gets its own sibling, {@link ReasoningRepetitionDetector},
+ * since the exemptions that keep this class off legitimate output are wrong for
+ * thinking (see {@link trailingReasoningCycle}). Free of Cordis types so the
+ * decision rule is unit-testable without a harness.
  */
 export class TextRepetitionDetector {
   private texts: string[] = []
   private broken = false
   private visible = ''
   private lastCycleCheck = 0
-  private reason: 'identical-chunks' | 'repeating-cycle' | undefined
-
+  private reason: BreakRule | undefined
   /**
    * @param config - the resolved plugin configuration.
    */
@@ -624,7 +750,7 @@ export class TextRepetitionDetector {
   }
 
   /** Which rule fired, for the log line and for tests. */
-  get trippedBy(): 'identical-chunks' | 'repeating-cycle' | undefined {
+  get trippedBy(): BreakRule | undefined {
     return this.reason
   }
 
@@ -665,6 +791,79 @@ export class TextRepetitionDetector {
     if (span === 0) return false
     this.broken = true
     this.reason = 'repeating-cycle'
+    return true
+  }
+}
+
+/**
+ * The intra-call breaker for the **reasoning** channel: watches one call's
+ * thinking and reports when the model has collapsed onto a short repeated unit.
+ *
+ * A sibling of {@link TextRepetitionDetector} rather than a mode of it, because
+ * the two watch different text under different exemptions (see
+ * {@link trailingReasoningCycle}) even though they share one periodic-tail scan.
+ * Free of Cordis types so the decision rule is unit-testable without a harness.
+ *
+ * Discussion #9524 is why it exists. Under the `deepseek-vision` channel with a
+ * flash-tier model thinking in Chinese, a reasoning block degenerates into
+ * self-replication of the shortest standalone sentence — `好。好。好。`, `Go. Go.
+ * Go.` — measured at 57–62% of block-tail fragments being ≤2 characters and a
+ * longest repeated fragment run of 7298, with the reply swallowed and the
+ * session unusable. Every rule that already existed is structurally unable to
+ * act on it: the visible-output breaker never receives a reasoning delta, and
+ * this plugin's own post-call judgement reads reasoning only *after* the call has
+ * spent its whole output budget, and then needs three consecutive stalled calls.
+ * The worst call of a session was the one nothing could interrupt.
+ */
+export class ReasoningRepetitionDetector {
+  private broken = false
+  private text = ''
+  private lastCheck = 0
+  private chars = 0
+
+  /**
+   * @param config - the resolved plugin configuration.
+   */
+  constructor(private readonly config: ResolvedConfig) {}
+
+  /** Whether the breaker has already fired for this call. */
+  get tripped(): boolean {
+    return this.broken
+  }
+
+  /** Which rule fired, for the log line and for tests. */
+  get trippedBy(): BreakRule | undefined {
+    return this.broken ? 'repeating-reasoning' : undefined
+  }
+
+  /** Reasoning characters observed so far in this call. */
+  get emittedChars(): number {
+    return this.chars
+  }
+
+  /**
+   * Observe one `reasoning-delta` payload.
+   *
+   * @param text - the delta's text.
+   * @returns `true` exactly once, on the delta that completes the span.
+   */
+  push(text: string): boolean {
+    if (this.broken) return false
+    this.chars += text.length
+    if (this.config.maxRepeatedReasoningCycleChars <= 0) return false
+    this.text += text
+    // Same stride reasoning as the visible rule: the scan is bounded by the
+    // qualifying span, so a fixed stride keeps the whole rule linear in emitted
+    // characters even on a bleed that runs for hundreds of thousands of them.
+    if (this.text.length - this.lastCheck < CYCLE_CHECK_STRIDE) return false
+    this.lastCheck = this.text.length
+    const span = trailingReasoningCycle(
+      this.text,
+      this.config.maxRepeatedReasoningCycleChars,
+      this.config.minRepeatedReasoningCycleChars,
+    )
+    if (span === 0) return false
+    this.broken = true
     return true
   }
 }
@@ -730,6 +929,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * finish chunk while explicitly allowing `error`/`aborted` to leave blocks
    * open. Returning without one would violate that grammar.
    *
+   * The same holds one layer up for the **reasoning** rule: `interruptedBlocks()`
+   * (`packages/llm/llm/src/assembler.ts`) enumerates "closed and open text/reasoning
+   * blocks with non-whitespace content", so an `error` finish with a reasoning
+   * block still open is the sanctioned outcome here too, and the block that was
+   * emitted is kept as the attempt's prefix. The invariant test in
+   * `test/reasoning-breaker.spec.mjs` runs the reasoning cut through the shipped
+   * validator rather than trusting that reading.
+   *
    * Order matters — steer first, then return the terminal chunk. The user
    * message must be durably enqueued *before* the `error` finish throws out of
    * the step, so the resumed turn that the loop's `turn/end` finally block
@@ -738,15 +945,17 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * idle check, so this ordering is what makes the correction survive.
    *
    * @param agent - the live agent that owns the call.
-   * @param chars - visible-output characters emitted before the break.
+   * @param chars - characters of the offending channel emitted before the break.
+   * @param rule - which of the three rules fired.
    * @returns the terminal chunk to yield as the call's last.
    */
-  function breakStream(agent: GuardableAgent, chars: number, rule: 'identical-chunks' | 'repeating-cycle'): StreamChunk {
-    const detail = `the model repeated the same visible output for ${chars} characters in one call`
+  function breakStream(agent: GuardableAgent, chars: number, rule: BreakRule): StreamChunk {
+    const channel = rule === 'repeating-reasoning' ? 'reasoning' : 'visible output'
+    const detail = `the model repeated the same ${channel} for ${chars} characters in one call`
     ctx.logger.warn(`thinking-loop-guard: breaking a repetitive stream (${chars} chars, one call, rule: ${rule})`)
     if (config.breakCorrection) {
       agent.steer(message(
-        `Your output had repeated itself for ${chars} characters without progressing, so the response was `
+        `Your ${channel} had repeated itself for ${chars} characters without progressing, so the response was `
         + 'cut off mid-stream. Do not resume the repetition: state the conclusion once, briefly, and then '
         + 'either call a tool or finish the answer.',
         'notice',
@@ -772,18 +981,24 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       let reasoning = ''
       let hasOutput = false
       const textBreaker = new TextRepetitionDetector(config)
+      const reasoningBreaker = new ReasoningRepetitionDetector(config)
       for await (const chunk of next()) {
         if (chunk.type === 'reasoning-delta') reasoning += chunk.text
         else if (chunk.type === 'text-delta' || chunk.type === 'tool-call-delta') hasOutput = true
         yield chunk
-        // Visible-output repetition is the one failure the post-call judgement
-        // above cannot reach (issue #2848: ~2825 repeats inside ONE call), so it
+        // Repetition inside ONE call is the failure the post-call judgement above
+        // cannot reach (issue #2848: ~2825 repeats in a call that never ended;
+        // discussion #9524: a reasoning block collapsed to one short unit), so it
         // is checked per chunk and ends the stream while it is still open. The
         // returning branch skips the post-call observation: the call did not
         // finish, and its breaker already reacted.
         if (chunk.type === 'text-delta' && textBreaker.push(chunk.text)) {
           // `return` here ends the generator — this is not the C# `yield break`.
           yield breakStream(agent, textBreaker.emittedChars, textBreaker.trippedBy ?? 'identical-chunks')
+          return
+        }
+        if (chunk.type === 'reasoning-delta' && reasoningBreaker.push(chunk.text)) {
+          yield breakStream(agent, reasoningBreaker.emittedChars, 'repeating-reasoning')
           return
         }
       }

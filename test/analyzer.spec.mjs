@@ -261,6 +261,97 @@ test('analyzer does not flag a legitimately repetitive but healthy call', () => 
 })
 
 /* -------------------------------------------------------------------------- */
+/* the discussion #9524 shape: a call whose THINKING collapses onto one unit   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The tool's contract is "the same decision rule the plugin runs" — so a rule
+ * the plugin ships and this tool does not answer for would make the tool quietly
+ * wrong about the sessions it is run on. Discussion #9524's reporters have the
+ * session files; these fixtures are the shape they would run it against.
+ */
+test('analyzer flags a call whose reasoning collapses onto one short sentence', () => {
+  // 200 deltas of the 2-character unit = 400 characters: past the 256 span.
+  const texts = Array.from({ length: 200 }, (_, i) => [i, '好。'])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 7, step: 3, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 1, 'the reasoning deltas must be parsed, not skipped')
+  assert.ok(steps[0].reasoningCycleSpan >= 256, `the reasoning rule must see it, got ${steps[0].reasoningCycleSpan}`)
+  assert.equal(steps[0].wouldBreak, true)
+  assert.equal(steps[0].wouldBreakBy, 'repeating-reasoning')
+})
+
+test('analyzer flags a single-character reasoning bleed the visible rule cannot', () => {
+  // Period 1, which is the whole reason the reasoning rule carries its own
+  // function: the visible rule is silent on this by design.
+  const texts = Array.from({ length: 400 }, (_, i) => [i, '好'])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.ok(steps[0].reasoningCycleSpan >= 256, `got ${steps[0].reasoningCycleSpan}`)
+  assert.equal(steps[0].wouldBreakBy, 'repeating-reasoning')
+})
+
+test('analyzer reads the reasoning shape from the v1 assistant/chunk format too', () => {
+  const lines = Array.from({ length: 400 }, (_, i) => ({
+    type: 'assistant/chunk', seq: i, time: 0,
+    data: { turn: 0, step: 0, chunk: { type: 'reasoning-delta', index: 0, text: 'Go. ' } },
+  }))
+  const { steps } = run(writeSession(lines))
+  assert.ok(steps[0].reasoningCycleSpan >= 256, `got ${steps[0].reasoningCycleSpan}`)
+  assert.equal(steps[0].wouldBreakBy, 'repeating-reasoning')
+  assert.equal(steps[0].textChars, 0, 'the reasoning channel must not be read as visible output')
+})
+
+test('analyzer does not flag reasoning that restates itself without becoming periodic', () => {
+  const texts = Array.from({ length: 200 }, (_, i) => [i, `第 ${i} 步：我需要先读文件，再判断是否需要修改。\n`])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].reasoningCycleSpan, 0)
+  assert.equal(steps[0].wouldBreak, false)
+})
+
+test('the reasoning rule can be switched off for the run, independently', () => {
+  // 200 deltas of the 2-character unit = 400 characters: past the 256 span.
+  const texts = Array.from({ length: 200 }, (_, i) => [i, '好。'])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file, ['--max-repeated-reasoning-cycle', '0'])
+  assert.equal(steps[0].reasoningCycleSpan, 0)
+  assert.equal(steps[0].wouldBreak, false)
+  // …and the span minimum is a real knob, not a second off switch.
+  const { steps: tight } = run(file, ['--min-repeated-reasoning-cycle', '512'])
+  assert.equal(tight[0].reasoningCycleSpan, 0)
+})
+
+test('the text report names the reasoning column and the rule it counts', () => {
+  const texts = Array.from({ length: 200 }, (_, i) => [i, '好。'])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const out = runText(file)
+  assert.match(out, /reasonCycle/, 'the column must be in the table header')
+  assert.match(out, /1 by a repeating cycle in the reasoning/)
+  assert.match(out, /BREAK\(repeating-reasoning\)/)
+})
+
+/* -------------------------------------------------------------------------- */
 /* issue #1, 2026-09-20: a silent zero is not a verdict                       */
 /* -------------------------------------------------------------------------- */
 
