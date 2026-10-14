@@ -111,7 +111,7 @@ function measure(line) {
   const build = run('npx', ['tsc'], dir)
   if (!build.ok) return { line, stage: 'tsc', detail: build.out.trim().split('\n').slice(0, 2).join(' | ') }
 
-  const suite = run('node', ['--test', 'test/source-kind.spec.mjs', 'test/detection.spec.mjs', 'test/text-breaker.spec.mjs', 'test/analyzer.spec.mjs', 'test/inject.spec.mjs', 'test/inject-mechanism.spec.mjs', 'test/peer-range.spec.mjs', 'test/cancel-cause.spec.mjs'], dir)
+  const suite = run('node', ['--test', 'test/source-kind.spec.mjs', 'test/detection.spec.mjs', 'test/text-breaker.spec.mjs', 'test/reasoning-breaker.spec.mjs', 'test/reasoning-novelty.spec.mjs', 'test/analyzer.spec.mjs', 'test/inject.spec.mjs', 'test/inject-mechanism.spec.mjs', 'test/peer-range.spec.mjs', 'test/cancel-cause.spec.mjs'], dir)
   const summary = /^ℹ pass (\d+)$/m.exec(suite.out)
   const failed = /^ℹ fail (\d+)$/m.exec(suite.out)
   if (!suite.ok || summary === null || Number(failed?.[1] ?? 1) !== 0) {

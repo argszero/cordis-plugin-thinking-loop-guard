@@ -55,7 +55,7 @@
  * `coverage`, with `verdictScopeIncomplete` as the machine-readable flag.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, countRepeatedText, trailingCycle, trailingReasoningCycle } from '../lib/index.js'
+import { LoopDetector, SentenceUnitCounter, countRepeatedText, trailingCycle, trailingReasoningCycle } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -68,13 +68,16 @@ const DEFAULT_CONFIG = {
   minRepeatedCycleChars: 256,
   maxRepeatedReasoningCycleChars: 64,
   minRepeatedReasoningCycleChars: 256,
+  minReasoningSentenceChars: 8,
+  minReasoningSentences: 64,
+  minReasoningNoveltyRatio: 0.05,
 }
 
 function parseArgs(argv) {
   const config = { ...DEFAULT_CONFIG }
   let file
   let asJson = false
-  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires', '--max-repeated-text': 'maxRepeatedText', '--max-repeated-cycle': 'maxRepeatedCycleChars', '--min-repeated-cycle': 'minRepeatedCycleChars', '--max-repeated-reasoning-cycle': 'maxRepeatedReasoningCycleChars', '--min-repeated-reasoning-cycle': 'minRepeatedReasoningCycleChars' }
+  const flags = { '--similarity': 'similarityThreshold', '--threshold': 'maxThinkingSteps', '--min-chars': 'minReasoningChars', '--max-fires': 'maxFires', '--max-repeated-text': 'maxRepeatedText', '--max-repeated-cycle': 'maxRepeatedCycleChars', '--min-repeated-cycle': 'minRepeatedCycleChars', '--max-repeated-reasoning-cycle': 'maxRepeatedReasoningCycleChars', '--min-repeated-reasoning-cycle': 'minRepeatedReasoningCycleChars', '--min-reasoning-sentence-chars': 'minReasoningSentenceChars', '--min-reasoning-sentences': 'minReasoningSentences', '--min-reasoning-novelty': 'minReasoningNoveltyRatio' }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--json') { asJson = true; continue }
@@ -326,10 +329,25 @@ for (const [index, step] of steps.entries()) {
     config.maxRepeatedReasoningCycleChars,
     config.minRepeatedReasoningCycleChars,
   )
+  // The density rule runs on the same input for the same reason. It is a
+  // different statistic from `reasoningCycleSpan`, not a looser version of it: a
+  // call can cycle twenty sentences at a period past `maxRepeatedReasoningCycleChars`
+  // (so no tail is ever periodic) and still have almost nothing new to say.
+  const units = new SentenceUnitCounter(config.minReasoningSentenceChars)
+  let noveltyAtBreak = null
+  if (config.minReasoningNoveltyRatio > 0) {
+    for (const delta of step.reasonings) {
+      units.push(delta)
+      if (noveltyAtBreak === null
+        && units.total >= config.minReasoningSentences
+        && units.novelty <= config.minReasoningNoveltyRatio) noveltyAtBreak = units.novelty
+    }
+  }
   const byChunks = config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText
   const byCycle = cycleSpan > 0
   const byReasoning = reasoningCycleSpan > 0
-  const wouldBreakBy = byChunks ? 'identical-chunks' : (byCycle ? 'repeating-cycle' : (byReasoning ? 'repeating-reasoning' : null))
+  const byNovelty = noveltyAtBreak !== null
+  const wouldBreakBy = byChunks ? 'identical-chunks' : (byCycle ? 'repeating-cycle' : (byReasoning ? 'repeating-reasoning' : (byNovelty ? 'reasoning-novelty' : null)))
   report.push({
     step: index + 1,
     turn: step.turn,
@@ -346,6 +364,9 @@ for (const [index, step] of steps.entries()) {
     repeatedRun: repeatRun,
     cycleSpan,
     reasoningCycleSpan,
+    // Density at the moment the rule would have fired, or the whole call's
+    // density when it would not. `1` means "nothing repeated yet".
+    reasoningNovelty: noveltyAtBreak ?? units.novelty,
     wouldBreak: wouldBreakBy !== null,
     wouldBreakBy,
   })
@@ -379,7 +400,7 @@ if (asJson) {
   console.log(`config:  ${JSON.stringify(config)}`)
   console.log(`steps:   ${steps.length} model call(s)`)
   console.log('')
-  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  reasonCycle  break')
+  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  reasonCycle  novelty  break')
   for (const row of report) {
     console.log(
       `  ${String(row.step).padStart(2)}  ${String(row.turn)}/${String(row.call)}`.padEnd(20)
@@ -387,6 +408,7 @@ if (asJson) {
       + `${String(row.textChunks).padStart(6)}  ${row.verdict.padEnd(18)}  ${String(row.fired ?? '').padEnd(5)}  `
       + `${String(row.repeatedRun).padStart(11)}  ${String(row.cycleSpan).padStart(9)}  `
       + `${String(row.reasoningCycleSpan).padStart(11)}  `
+      + `${row.reasoningNovelty.toFixed(3).padStart(7)}  `
       + `${row.wouldBreak ? `BREAK(${row.wouldBreakBy})` : ''}`,
     )
   }
@@ -400,12 +422,15 @@ if (asJson) {
   const byChunks = report.filter(r => r.wouldBreakBy === 'identical-chunks').length
   const byCycle = report.filter(r => r.wouldBreakBy === 'repeating-cycle').length
   const byReasoning = report.filter(r => r.wouldBreakBy === 'repeating-reasoning').length
+  const byNovelty = report.filter(r => r.wouldBreakBy === 'reasoning-novelty').length
   console.log(`intra-call repetition: ${broken} call(s) would be cut mid-stream `
     + `(${byChunks} by identical chunks, maxRepeatedText = ${config.maxRepeatedText}; `
     + `${byCycle} by a repeating cycle in the visible output, maxRepeatedCycleChars = ${config.maxRepeatedCycleChars}, `
     + `minRepeatedCycleChars = ${config.minRepeatedCycleChars}; `
     + `${byReasoning} by a repeating cycle in the reasoning, maxRepeatedReasoningCycleChars = ${config.maxRepeatedReasoningCycleChars}, `
-    + `minRepeatedReasoningCycleChars = ${config.minRepeatedReasoningCycleChars})`)
+    + `minRepeatedReasoningCycleChars = ${config.minRepeatedReasoningCycleChars}; `
+    + `${byNovelty} by exhausted material in the reasoning, minReasoningNoveltyRatio = ${config.minReasoningNoveltyRatio}, `
+    + `minReasoningSentences = ${config.minReasoningSentences}, minReasoningSentenceChars = ${config.minReasoningSentenceChars})`)
   if (byCycle === 0 && byChunks === 0 && report.some(r => r.repeatedRun > 1)) {
     const worst = Math.max(...report.map(r => r.repeatedRun))
     console.log(`  (the longest identical-chunk run seen was ${worst}; lower --max-repeated-text to cut such calls)`)

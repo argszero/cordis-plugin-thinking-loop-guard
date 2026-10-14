@@ -300,6 +300,52 @@ export interface Config {
    */
   minRepeatedReasoningCycleChars?: number
   /**
+   * Shortest sentence unit, in characters, that counts toward the reasoning
+   * channel's **density** measure. Default `8`.
+   *
+   * A unit is the text between two sentence terminators (`.` `!` `?` `。` `！`
+   * `？` `…` or a newline), trimmed. The floor is what keeps generated documents
+   * clean: a JSON dump repeats its own `"kind": "item",` line forty times, and
+   * only the distinct `"id": N,` line on every record keeps the measure high —
+   * at a floor of 10 those id lines stop counting and the same dump fires
+   * falsely (measured 0.025 against the default threshold). At 8 it measures
+   * 0.35. The floor is also the smallest one at which a seven-character Chinese
+   * clause plus its full stop is still countable, so it is pinned from both
+   * sides rather than picked.
+   */
+  minReasoningSentenceChars?: number
+  /**
+   * How many sentence units a call must produce before its novelty is judged.
+   * Default `64`.
+   *
+   * A ratio over a handful of units says nothing: a three-sentence call cannot
+   * demonstrate that it is out of material. The value is set where the measure
+   * was actually calibrated — of the real texts that reach 64 units, the lowest
+   * novelty is 0.885 — and it is low enough that a total collapse is cut at
+   * roughly a thousand characters rather than after a whole output budget. One
+   * unit is at least {@link Config.minReasoningSentenceChars} characters, so the
+   * floor is also a character floor: 64 units cannot span fewer than 512.
+   */
+  minReasoningSentences?: number
+  /**
+   * Intra-call **density**: the lowest share of a call's sentence units that must
+   * be new material before the call is judged degenerate. `0` disables the rule.
+   * Default `0.05`.
+   *
+   * The complement of the shape rules rather than a replacement. A call that
+   * cycles twenty sentences has a *tail* that is never periodic — the period is
+   * 489 characters, past the 64 cap — and, in the irregular case, no period at
+   * all; but it also has almost nothing new to say, which is what this measures.
+   * Measured on those shapes: 0.0001 for one repeated sentence, 0.0043 for the
+   * twenty-sentence cycle in either order. Measured on real text (60 recorded
+   * reasoning blocks, 3,983 long assistant messages): never below 0.885 once a
+   * call reaches the unit floor. The two sets are two orders of magnitude apart,
+   * and 0.05 sits in that gap — about the geometric mean of its two nearest
+   * neighbours (0.0043 and 0.885), so the exact value inside the gap is not
+   * load-bearing.
+   */
+  minReasoningNoveltyRatio?: number
+  /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
    *
@@ -333,6 +379,9 @@ export const Config: z<Config> = z.object({
   minRepeatedCycleChars: z.number().step(1).min(2).default(256),
   maxRepeatedReasoningCycleChars: z.number().step(1).min(0).default(64),
   minRepeatedReasoningCycleChars: z.number().step(1).min(2).default(256),
+  minReasoningSentenceChars: z.number().step(1).min(2).default(8),
+  minReasoningSentences: z.number().step(1).min(2).default(64),
+  minReasoningNoveltyRatio: z.number().min(0).max(1).default(0.05),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
 })
@@ -616,9 +665,28 @@ const CONTENT_CHAR = /[\p{L}\p{N}]/u
  * Which rules the mid-stream breaker ships, as reported in the log line.
  *
  * JSDoc'd rather than left inline because the analyzer and the tests switch on
- * the same three strings.
+ * the same four strings.
+ *
+ * Three of them measure a **shape** — a periodicity in the text. The fourth
+ * measures **density**: not "is the tail periodic" but "did this call say
+ * anything it had not already said". The two are different statistics over the
+ * same text, and a call can be degenerate under either one alone (see
+ * {@link SentenceUnitCounter} for why the shape rules cannot see density).
  */
-export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'repeating-reasoning'
+export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'repeating-reasoning' | 'reasoning-novelty'
+
+/** The rules that watch the reasoning channel, in one place for `breakStream`. */
+const REASONING_RULES: readonly BreakRule[] = ['repeating-reasoning', 'reasoning-novelty']
+
+/**
+ * Sentence terminators. What separates one unit from the next, kept with the
+ * unit it ends.
+ *
+ * A newline is included deliberately: in code-heavy thinking the line, not the
+ * full stop, is the sentence, and a rule that only split on `.!?` would read a
+ * pasted listing as one enormous sentence.
+ */
+const SENTENCE_TERMINATOR = /[.!?。！？…\n]/
 
 /**
  * The tail span that is an exact repetition of one period `admits` accepts, or
@@ -721,6 +789,102 @@ export function trailingReasoningCycle(text: string, maxPeriod: number, minSpan:
 }
 
 /**
+ * Intra-call **density**: the share of one call's sentence units that the model
+ * had not already produced (discussions #5976, #9683).
+ *
+ * Every other rule in this file measures a **shape** — a periodicity in the
+ * text. Density is a different statistic over the same characters, and the
+ * reports that motivate this class are exactly the shapes a shape rule cannot
+ * see: #9683's thinking collapsed onto twenty sentences cycled in a fixed order
+ * (a period of 489 characters, far past {@link trailingCycle}'s cap of 64, so no
+ * tail is ever periodic) and onto the same twenty in an **irregular** order (no
+ * period exists at all); #5976's is the same hole from the other side, short
+ * fragments interleaved among ordinary sentences so the tail never settles.
+ *
+ * The measure is `distinct / total` over whole sentence units — never a
+ * substring count. The distinction is load-bearing and was measured: in #5976's
+ * own text the substring `好。` occurs 4 times while the text contains 3 units,
+ * because `完好。` ("intact") contains `好。` inside an ordinary word. A substring
+ * rule reports repetitions no reader can see; whole units cannot.
+ *
+ * Calibrated on three sets, all measured (`tmp/c647/measure-5..7.mjs`):
+ *
+ *  - **Reported shapes** (#9683's four, plus a Chinese twin built from the same
+ *    vocabulary): `0.0001` for a single repeated sentence, `0.0043` for the
+ *    twenty-sentence cycle in either order. All fire.
+ *  - **Real text**: 60 recorded reasoning blocks and 3,983 long assistant
+ *    messages from this project's own session history. Of the 96 texts that
+ *    reach {@link Config.minReasoningSentences} units at the default unit floor,
+ *    the lowest novelty is **0.885** — 17x above the default threshold.
+ *  - **Generated-document negatives** (the plugin's own list: a markdown table,
+ *    generated CSS, a JSON dump, a log listing, repeated code stubs, a bullet
+ *    list): all stay at or above **0.35**.
+ *
+ * The unit floor exists for the last set. A JSON dump repeats its own
+ * `"kind": "item",` line 40 times; what keeps that from reading as a loop is
+ * that every record contributes a distinct id, and the floor is what stops the
+ * short structural lines from being counted at all. At 8 characters the dump
+ * measures 0.35; at 10 the floor swallows the ids' shorter neighbours and the
+ * same dump measures 0.025, i.e. it FALSELY fires. 8 is also the floor at which
+ * a 7-character Chinese clause plus its `。` is still a countable unit, so it is
+ * pinned from both sides rather than chosen.
+ */
+export class SentenceUnitCounter {
+  private readonly seen = new Set<string>()
+  private pending = ''
+  private units = 0
+
+  /**
+   * @param minChars - shortest trimmed unit that counts toward the tally. Units
+   * shorter than this are dropped, not merged into the next one.
+   */
+  constructor(private readonly minChars: number) {}
+
+  /** How many sentence units the text has produced. */
+  get total(): number {
+    return this.units
+  }
+
+  /** How many of those units are distinct. */
+  get distinct(): number {
+    return this.seen.size
+  }
+
+  /**
+   * Share of the call's units that are new material: `distinct / total`, or `1`
+   * while no unit has finished (an empty text is not evidence of a loop).
+   */
+  get novelty(): number {
+    return this.units === 0 ? 1 : this.seen.size / this.units
+  }
+
+  /**
+   * Observe one delta of the channel.
+   *
+   * Incremental by construction: only the fragment after the last terminator is
+   * carried between calls, so a delta may split a sentence anywhere — including
+   * mid-character-run — without changing the tally.
+   *
+   * @param text - the delta's text.
+   * @returns the novelty after this delta (see {@link novelty}).
+   */
+  push(text: string): number {
+    this.pending += text
+    let start = 0
+    for (let i = 0; i < this.pending.length; i++) {
+      if (!SENTENCE_TERMINATOR.test(this.pending[i]!)) continue
+      const unit = this.pending.slice(start, i + 1).trim()
+      start = i + 1
+      if (unit.length < this.minChars) continue
+      this.units++
+      this.seen.add(unit)
+    }
+    this.pending = this.pending.slice(start)
+    return this.novelty
+  }
+}
+
+/**
  * The intra-call breaker: watches one call's visible output and reports when the
  * model has repeated itself enough to be considered degenerate.
  *
@@ -814,17 +978,44 @@ export class TextRepetitionDetector {
  * this plugin's own post-call judgement reads reasoning only *after* the call has
  * spent its whole output budget, and then needs three consecutive stalled calls.
  * The worst call of a session was the one nothing could interrupt.
+ *
+ * It carries two rules, and they are different statistics over the same text:
+ * the **shape** rule ({@link trailingReasoningCycle}) ends a call whose tail has
+ * collapsed onto a short cycle, and the **density** rule
+ * ({@link SentenceUnitCounter}) ends one that has run out of things to say even
+ * though no period exists. Discussion #9683's thinking does the second without
+ * the first — twenty sentences cycled at a period of 489 characters, and the same
+ * twenty in an irregular order — and #5976's does it with short fragments
+ * interleaved among ordinary sentences. Only one of the two can fire per call;
+ * the shape rule is checked first because it is the more specific finding and,
+ * on the shapes both reach, fires far earlier.
  */
 export class ReasoningRepetitionDetector {
   private broken = false
   private text = ''
   private lastCheck = 0
   private chars = 0
+  private reason: BreakRule | undefined
+  private readonly units: SentenceUnitCounter
+  /**
+   * The density arm's three knobs, normalized once.
+   *
+   * `ResolvedConfig` makes them required, so a TypeScript caller cannot omit
+   * them; the `??` is for the untyped callers that do exist — the tests and the
+   * offline analyzer both build a plain object. It resolves toward **off**, so an
+   * omitted key can never make a guard fire.
+   */
+  private readonly noveltyRatio: number
+  private readonly minSentences: number
 
   /**
    * @param config - the resolved plugin configuration.
    */
-  constructor(private readonly config: ResolvedConfig) {}
+  constructor(private readonly config: ResolvedConfig) {
+    this.noveltyRatio = config.minReasoningNoveltyRatio ?? 0
+    this.minSentences = config.minReasoningSentences ?? 2
+    this.units = new SentenceUnitCounter(config.minReasoningSentenceChars ?? 8)
+  }
 
   /** Whether the breaker has already fired for this call. */
   get tripped(): boolean {
@@ -833,12 +1024,21 @@ export class ReasoningRepetitionDetector {
 
   /** Which rule fired, for the log line and for tests. */
   get trippedBy(): BreakRule | undefined {
-    return this.broken ? 'repeating-reasoning' : undefined
+    return this.reason
   }
 
   /** Reasoning characters observed so far in this call. */
   get emittedChars(): number {
     return this.chars
+  }
+
+  /**
+   * Novelty of the reasoning observed so far, or `1` while the density rule is
+   * off or has too few units to judge. Exposed for the tests and the analyzer,
+   * which report the number the decision was made from.
+   */
+  get novelty(): number {
+    return this.units.novelty
   }
 
   /**
@@ -850,20 +1050,36 @@ export class ReasoningRepetitionDetector {
   push(text: string): boolean {
     if (this.broken) return false
     this.chars += text.length
-    if (this.config.maxRepeatedReasoningCycleChars <= 0) return false
+    if (this.config.maxRepeatedReasoningCycleChars <= 0 && this.noveltyRatio <= 0) return false
     this.text += text
+    // The density tally is updated on EVERY delta, not on the stride: dropping a
+    // delta would drop the units inside it. Only the judgement is strided.
+    if (this.noveltyRatio > 0) this.units.push(text)
     // Same stride reasoning as the visible rule: the scan is bounded by the
     // qualifying span, so a fixed stride keeps the whole rule linear in emitted
     // characters even on a bleed that runs for hundreds of thousands of them.
     if (this.text.length - this.lastCheck < CYCLE_CHECK_STRIDE) return false
     this.lastCheck = this.text.length
-    const span = trailingReasoningCycle(
-      this.text,
-      this.config.maxRepeatedReasoningCycleChars,
-      this.config.minRepeatedReasoningCycleChars,
-    )
-    if (span === 0) return false
+    // Shape first: it is the more specific finding, and on the shapes both rules
+    // reach (one sentence repeated forever) it fires far earlier, so which rule a
+    // call is attributed to stays stable.
+    if (this.config.maxRepeatedReasoningCycleChars > 0) {
+      const span = trailingReasoningCycle(
+        this.text,
+        this.config.maxRepeatedReasoningCycleChars,
+        this.config.minRepeatedReasoningCycleChars,
+      )
+      if (span > 0) {
+        this.broken = true
+        this.reason = 'repeating-reasoning'
+        return true
+      }
+    }
+    if (this.noveltyRatio <= 0) return false
+    if (this.units.total < this.minSentences) return false
+    if (this.units.novelty > this.noveltyRatio) return false
     this.broken = true
+    this.reason = 'reasoning-novelty'
     return true
   }
 }
@@ -950,7 +1166,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @returns the terminal chunk to yield as the call's last.
    */
   function breakStream(agent: GuardableAgent, chars: number, rule: BreakRule): StreamChunk {
-    const channel = rule === 'repeating-reasoning' ? 'reasoning' : 'visible output'
+    const channel = REASONING_RULES.includes(rule) ? 'reasoning' : 'visible output'
     const detail = `the model repeated the same ${channel} for ${chars} characters in one call`
     ctx.logger.warn(`thinking-loop-guard: breaking a repetitive stream (${chars} chars, one call, rule: ${rule})`)
     if (config.breakCorrection) {
@@ -998,7 +1214,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           return
         }
         if (chunk.type === 'reasoning-delta' && reasoningBreaker.push(chunk.text)) {
-          yield breakStream(agent, reasoningBreaker.emittedChars, 'repeating-reasoning')
+          yield breakStream(agent, reasoningBreaker.emittedChars, reasoningBreaker.trippedBy ?? 'repeating-reasoning')
           return
         }
       }

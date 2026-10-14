@@ -338,6 +338,74 @@ test('the reasoning rule can be switched off for the run, independently', () => 
   assert.equal(tight[0].reasoningCycleSpan, 0)
 })
 
+test('analyzer flags a call that cycles its sentences past the period cap', () => {
+  // Discussion #9683's block: twenty sentences, period 489 characters. The shape
+  // rule cannot see it at all (its period cap is 64, so no tail is ever
+  // periodic); the density rule can. Both numbers are asserted, because the
+  // point of shipping a second statistic is that the first one misses.
+  const sentences = [
+    'Let me write the file.', 'Let me run the command.', 'I will write the file now.',
+    'Let me check the output.', 'Let me run it again.', 'I need to write this down.',
+    'Let me apply the patch.', 'Let me verify the result.', 'Let me run the tests.',
+    'I will write the next one.', 'Let me inspect the file.', 'Let me run the command now.',
+    'Let me update the file.', 'Let me check the logs.', 'I will run the command.',
+    'Let me write the answer.', 'Let me confirm the change.', 'Let me run the build.',
+    'Let me write it out.', 'Let me finish the step.',
+  ]
+  const texts = Array.from({ length: 700 }, (_, i) => [i, `${sentences[i % 20]} `])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 4, step: 1, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].reasoningCycleSpan, 0, 'no tail is periodic — this is the shape the cycle rule misses')
+  assert.equal(steps[0].wouldBreak, true)
+  assert.equal(steps[0].wouldBreakBy, 'reasoning-novelty')
+  assert.ok(steps[0].reasoningNovelty <= 0.05, `got ${steps[0].reasoningNovelty}`)
+})
+
+test('analyzer reports the density it measured even when the rule does not fire', () => {
+  const texts = Array.from({ length: 700 }, (_, i) => [i, `第 ${i} 步：我需要先读文件，再判断是否需要修改。\n`])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].wouldBreak, false)
+  assert.equal(steps[0].reasoningNovelty, 1, 'every unit is new material')
+})
+
+test('the density rule can be switched off for the run, independently', () => {
+  const sentences = ['Let me write the file.', 'Let me run the command.', 'Let me check the output.']
+  const texts = Array.from({ length: 700 }, (_, i) => [i, `${sentences[i % 3]} `])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const { steps } = run(file, ['--min-reasoning-novelty', '0'])
+  assert.equal(steps[0].wouldBreak, false, 'the density rule is off')
+  // …and the off switch is the only way it stops answering: the same file with
+  // the rule on is a break.
+  assert.equal(run(file).steps[0].wouldBreakBy, 'reasoning-novelty')
+})
+
+test('the text report names the density column and the rule it counts', () => {
+  const sentences = ['Let me write the file.', 'Let me run the command.', 'Let me check the output.']
+  const texts = Array.from({ length: 700 }, (_, i) => [i, `${sentences[i % 3]} `])
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts },
+    ] } },
+  ])
+  const out = runText(file)
+  assert.match(out, /novelty/, 'the column must be in the table header')
+  assert.match(out, /1 by exhausted material in the reasoning/)
+  assert.match(out, /BREAK\(reasoning-novelty\)/)
+})
+
 test('the text report names the reasoning column and the rule it counts', () => {
   const texts = Array.from({ length: 200 }, (_, i) => [i, '好。'])
   const file = writeSession([

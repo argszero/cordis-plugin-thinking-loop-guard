@@ -41,6 +41,14 @@ const CONFIG = {
   minRepeatedCycleChars: 256,
   maxRepeatedReasoningCycleChars: 64,
   minRepeatedReasoningCycleChars: 256,
+  // The density arm runs at its shipped default here too: these fixtures are all
+  // short-unit bleeds (period 1-4 characters), which the unit floor keeps out of
+  // the density tally entirely, so the arm must stay silent and leave the
+  // attribution to the shape rule. `reasoning-novelty.spec.mjs` owns the
+  // positives for it.
+  minReasoningSentenceChars: 8,
+  minReasoningSentences: 64,
+  minReasoningNoveltyRatio: 0.05,
   breakCode: 'REPETITIVE_OUTPUT',
   breakCorrection: true,
 }
