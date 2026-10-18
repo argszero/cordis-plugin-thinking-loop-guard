@@ -544,6 +544,20 @@ second and rejected the `0.1.5` line (`ERESOLVE`); v0.1.6 shipped a union that h
 simply gone stale — it refused the `0.1.3-alpha.2` line and the whole `0.1.6`
 line, newest release included, for a plugin whose suite passes on both.
 
+That segment is written as its own comparator rather than by widening the one
+before it to `>=0.2.0-rc.1 <0.3.0-0`, and the difference is not cosmetic — it
+matters only on the *other* reading of the same range. Measured with `semver@7`
+over the published list: `>=0.2.0-rc.1 <0.3.0-0` admits **15** of the 22 lines
+under default semantics and all 22 with `includePrerelease: true`, while the
+shipped segments admit the same 22 on both readings. A prerelease passes a group
+only when a comparator in the *same* `major.minor.patch` tuple carries a
+prerelease tag, and `0.2.1-alpha.1` has no comparator of that tuple in the wide
+form. dsh reads the range with `includePrerelease: true`
+(`plugin-compatibility.ts:52`) and npm reads it without, so a range that is
+correct for dsh can still make `npm install` refuse the newest line — the same
+two-consumer split this file already documents for the old union, one level
+finer.
+
 The range deliberately admits **only** the lines this plugin is tested on: the
 twenty-two listed in `test/peer-lines.mjs`, and nothing else among the published
 versions. Everything older (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`) gets a
