@@ -111,13 +111,20 @@ function measure(line) {
   const build = run('npx', ['tsc'], dir)
   if (!build.ok) return { line, stage: 'tsc', detail: build.out.trim().split('\n').slice(0, 2).join(' | ') }
 
-  const suite = run('node', ['--test', 'test/source-kind.spec.mjs', 'test/detection.spec.mjs', 'test/text-breaker.spec.mjs', 'test/reasoning-breaker.spec.mjs', 'test/reasoning-novelty.spec.mjs', 'test/analyzer.spec.mjs', 'test/inject.spec.mjs', 'test/inject-mechanism.spec.mjs', 'test/peer-range.spec.mjs', 'test/cancel-cause.spec.mjs'], dir)
+  const suite = run('node', ['--test', 'test/source-kind.spec.mjs', 'test/detection.spec.mjs', 'test/text-breaker.spec.mjs', 'test/reasoning-breaker.spec.mjs', 'test/reasoning-novelty.spec.mjs', 'test/analyzer.spec.mjs', 'test/grammar.spec.mjs', 'test/inject.spec.mjs', 'test/inject-mechanism.spec.mjs', 'test/peer-range.spec.mjs', 'test/cancel-cause.spec.mjs'], dir)
   const summary = /^ℹ pass (\d+)$/m.exec(suite.out)
   const failed = /^ℹ fail (\d+)$/m.exec(suite.out)
+  // A skipped arm is reported beside the pass count, never folded into it: from
+  // `0.2.1-alpha.1` on the grammar cross-check cannot run (upstream removed the
+  // module it compares against), and "N pass" alone would hide that.
+  const skipped = /^ℹ skipped (\d+)$/m.exec(suite.out)
   if (!suite.ok || summary === null || Number(failed?.[1] ?? 1) !== 0) {
     return { line, stage: 'suite', detail: suite.out.trim().split('\n').filter(l => l.startsWith('✖') || l.startsWith('Error')).slice(0, 2).join(' | ') || 'no pass/fail summary' }
   }
-  return { line, stage: 'pass', detail: `${summary[1]} tests pass` }
+  const skippedNote = Number(skipped?.[1] ?? 0) > 0
+    ? `, ${skipped[1]} skipped (grammar cross-check: this line publishes no @deepseek-ai/dsh-llm/invariant)`
+    : ''
+  return { line, stage: 'pass', detail: `${summary[1]} tests pass${skippedNote}` }
 }
 
 const only = process.argv.find(arg => arg.startsWith('--line='))?.slice('--line='.length)

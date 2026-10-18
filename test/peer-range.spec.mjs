@@ -88,6 +88,36 @@ test('the newest shipped dsh line is admitted (issue #1 regression)', () => {
   }
 })
 
+test('the upper bound is a minor line, not a release (issue #3)', () => {
+  // Issue #3 (jilian-dsh, 2026-10-18): the union ended at `<0.2.1`. Under npm's
+  // reading that refuses `0.2.1-rc.N` outright — a prerelease is admitted only by
+  // a comparator sharing its tuple and carrying a prerelease — and, more to the
+  // point, the day `0.2.1` final ships every 0.2.1 profile would fail the peer
+  // check and `loadProfileDirectory()` would push the whole bundle into
+  // `skippedBundles`: the guard would stop loading and say nothing.
+  //
+  // So the newest measured line is bounded by the *minor* line, not by the next
+  // release. `0.3.0-0` rather than `0.3.0` because a bare `<0.3.0` would, under
+  // the `includePrerelease` reading dsh's own compatibility gate uses
+  // (`app-boot/src/plugin-compatibility.ts`, which the runtime applies to these
+  // peers), admit `0.3.0-alpha.N` — a next-minor prerelease nobody has run.
+  for (const dep of PEER_DEPS) {
+    const range = pkg.peerDependencies[dep]
+    for (const future of ['0.2.1', '0.2.2', '0.2.9']) {
+      assert.equal(satisfies(future, range), true, `${dep} must admit ${future}`)
+    }
+    for (const beyond of ['0.3.0-0', '0.3.0-alpha.1', '0.3.0', '0.3.1']) {
+      assert.equal(satisfies(beyond, range), false, `${dep} must not admit ${beyond}`)
+    }
+  }
+  // The alternative the issue also offered — one `engines.dsh` range — was
+  // declined deliberately: `unmetRequirements()` returns as soon as an own
+  // `engines.dsh` exists (`plugin-compatibility.ts:57-61`) and ignores peers
+  // entirely, so a single blanket range would silently widen the claim over
+  // lines this suite has never run. The union is the record of what was run.
+  assert.equal(Object.hasOwn(pkg, 'engines'), false, 'engines.dsh alone decides and would widen the support claim')
+})
+
 test('the dev pins stay on a line the range admits', () => {
   // A dev pin outside the peer range would mean the suite ran against a line the
   // published package refuses — the exact mismatch this file exists to prevent.

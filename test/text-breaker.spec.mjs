@@ -17,6 +17,10 @@ import assert from 'node:assert/strict'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
 import { TextRepetitionDetector, countRepeatedText } from '../lib/index.js'
+import { grammarSource, installGrammar } from './grammar.mjs'
+
+/** Which grammar this dsh line can offer; read once, named in every arm below. */
+const REGIME = await grammarSource()
 
 const CONFIG = {
   maxThinkingSteps: 3,
@@ -211,17 +215,16 @@ function chainContext(agent) {
   return { ctx, listeners }
 }
 
-/** Install the shipped dsh-llm invariant, returning the failures it records. */
+/**
+ * Install the stream grammar (see `./grammar.mjs`) and return the failures it
+ * records plus the regime that answered — `shipped` where the dsh line still
+ * publishes `@deepseek-ai/dsh-llm/invariant`, `frozen` where upstream removed it
+ * in `f028f25667`.
+ */
 async function installInvariant(context) {
-  const { apply } = await import('@deepseek-ai/dsh-llm/invariant')
   const failures = []
-  const fail = m => failures.push(m)
-  const inner = new Proxy(context, { get: (t, k) => (k === 'on' ? t.on.bind(t) : t[k]) })
-  await apply(
-    { ...inner, invariants: { register: (_name, installer) => installer(inner, fail) } },
-    fail,
-  )
-  return failures
+  const regime = await installGrammar(context, m => failures.push(m))
+  return { failures, regime }
 }
 
 /** Drive one raw stream through the whole installed chain. */
@@ -234,14 +237,16 @@ async function runChain(listeners, options, source) {
   return out
 }
 
-test('the break finish is protocol-legal: the shipped llm invariant accepts it', async () => {
-  // The breaker fires with the call's text block still OPEN, and the invariant
-  // only tolerates that for an `error`/`aborted` reason. This runs the wrapper's
-  // own output through the real validator instead of trusting a reading of
-  // `packages/llm/llm/src/invariant.ts` — which is precisely what an earlier
-  // `stop` finish got wrong ("finished with 1 open block(s)").
+test(`the break finish is protocol-legal: the ${REGIME} grammar accepts it`, async () => {
+  // The breaker fires with the call's text block still OPEN, and the grammar only
+  // tolerates that for an `error`/`aborted` reason. This runs the wrapper's own
+  // output through a validator instead of trusting a reading of the rules — which
+  // is precisely what an earlier `stop` finish got wrong ("finished with 1 open
+  // block(s)"). Which implementation answered is in the title, because from
+  // `0.2.1-alpha.1` on upstream ships no validator at all and a green there is a
+  // transcription agreeing, not the module.
   const { ctx, listeners } = chainContext(fakeAgent())
-  const failures = await installInvariant(ctx)
+  const { failures } = await installInvariant(ctx)
   plugin.apply(ctx, CONFIG)
   assert.equal(listeners.length, 2, 'the chain must be invariant -> plugin')
 

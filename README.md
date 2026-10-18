@@ -463,6 +463,7 @@ point: that failure is invisible to every per-call rule.
 
 | Version | Change |
 |---|---|
+| 0.3.2 | **Admits the whole `0.2.1` line, which the previous range excluded — and that exclusion was a silent break, not a conservative one** (issue [#3](https://github.com/argszero/cordis-plugin-thinking-loop-guard/issues/3)). The range ended at `>=0.2.0-rc.1 <0.2.1`, and dsh drops a profile bundle whose peers are unmet rather than warning about it (`unmetRequirements`, `packages/boot/app-boot/src/plugin-compatibility.ts`): installing the plugin beside a `0.2.1` dsh would have stopped it loading on the day that line shipped. The reason it was excluded is real but was answered with the wrong instrument: commit [`f028f25667`](https://github.com/deepseek-ai/deepseek-harness/commit/f028f25667) (2026-09-30, "remove runtime invariant plugins") deleted `@deepseek-ai/dsh-invariants` and every `<pkg>/invariant` subpath, so the arm that ran the plugin's synthesized `finish` through the real stream-grammar validator had nothing to call on those lines. Refusing the line protected the suite's completeness at the user's expense — a line the suite cannot fully test is still a line a user runs. The arm now **asks the shipped module where the line still publishes it and falls back to a frozen transcription** (`test/grammar.mjs`) where upstream removed it, naming the regime in the test title; `test/grammar.spec.mjs` holds the transcription to the module on every line that has one and reports itself skipped, with that reason, where none exists. `npm run test:probe-lines` re-measured **all twenty-two admitted lines** with every dsh peer pinned to the line: the fifteen lines through `0.2.0-rc.2` pass 134 tests, and each of the seven `0.2.1` lines passes 133 with exactly that one arm skipped — start there if a future line needs the same treatment. No `engines.dsh` field was added: in `unmetRequirements` it takes the decision alone, so declaring it would turn a measured per-line claim into an untested assertion that overrides the peer data. |
 | 0.3.1 | **The same code as 0.3.0, republished with a correct commit pointer.** `0.3.0` was published before its own commit existed, so the registry recorded the *previous* release's commit (`5f754cf`) as its `gitHead` — the tarball was right and the pointer was wrong, which is exactly the sort of thing a source-verifying consumer should not have to discover. No behaviour change; the file hashes of `lib/` are identical. Use this version. |
 | 0.3.0 | Adds the **density rule** (`minReasoningNoveltyRatio`, default 0.05; `minReasoningSentenceChars`, default 8; `minReasoningSentences`, default 64) for discussion [#9683](https://github.com/deepseek-ai/deepseek-harness/discussions/9683): a call that keeps producing sentences but has no new material left is now cut mid-call, which no shape rule can do. The reported block is 114,298 characters containing **only twenty distinct sentences**, cycled in one layout and irregular in another — the cycle rule's period ceiling is 64 and the reported period is 489, so no tail is ever periodic and it reports 0 at every span; the irregular layout has no period at all. The measure is the share of a call's **sentence units** (text between sentence terminators `.` `!` `?` `。` `！` `？` `…` or a newline, trimmed) that are distinct, counted over the whole call rather than its tail — a different statistic over the same characters, not a looser threshold. Whole units, never substrings: on #5976's own text the substring `好。` occurs 4 times while there are 3 units, because `完好。` contains it inside an ordinary word. Calibrated on the report's own shapes (0.0001 and 0.0043), 4,043 real texts (never below 0.885 once the unit floor is reached) and this plugin's six generated-document controls (never below 0.35) — `0.05` is roughly the geometric mean of its two nearest neighbours, and the unit floor of 8 is pinned from both sides (at 10 the JSON dump control fires falsely; at 8 a 7-character Chinese clause is still countable). The fifth shape of #5976 — two-character fragments interleaved among ordinary sentences — is **not** reached, because its statistic is fragment density rather than repetition share, and the README says so with the numbers. The analyzer gains the matching `reasoningNovelty` column, `--min-reasoning-novelty` and the summary line in the same release, for the same reason 0.2.0 added `reasoningCycleSpan`. `test/reasoning-novelty.spec.mjs` covers the primitive, the substring trap, both reported layouts, the six negative controls, the independent off switch, and the `apply()` cut through the shipped `llm/invariant`. |
 | 0.2.0 | Adds the **reasoning-channel breaker** (`maxRepeatedReasoningCycleChars`, default 64; `minRepeatedReasoningCycleChars`, default 256) for discussion [#9524](https://github.com/deepseek-ai/deepseek-harness/discussions/9524): a call whose **thinking** collapses onto the shortest standalone sentence (`好。好。好。`, `Go. Go. Go.`) is now cut mid-call, which no shipped rule could do — the visible-output breaker never receives a `reasoning-delta`, and the per-call detector only reads reasoning after the call has ended and then needs three consecutive stalled calls. Same algorithm and same span/period thresholds as the visible cycle rule, in a sibling detector, with one deliberate difference: a **one-character period is admitted when the repeated character is content**, because the reported mechanism collapses onto the *shortest* unit and the output rule's divider exemption would have left the decisive single-character case uncatchable. The miss that symmetry buys (a purely punctuation bleed) is documented rather than papered over. The analyzer gains the matching `reasoningCycleSpan` column in the same release, because a rule the plugin ships and the tool does not answer for would make the tool quietly wrong about the sessions it is run on. `test/reasoning-breaker.spec.mjs` covers the primitive, the period-1 decision, the false-positive controls, the `apply()` cut through the shipped `llm/invariant` (with a **reasoning** block still open), and the independent off switches. |
@@ -482,25 +483,33 @@ point: that failure is invisible to every per-call rule.
 
 ## Compatibility
 
-- **Every published dsh line from 0.1.2-rc.1 through 0.2.0-rc.2** — fifteen lines —
-  works: each has had the full suite run against it with **every** dsh package
-  pinned to that single line (79 tests, `tsc` clean). That matrix is not a table
+- **Every published dsh line from 0.1.2-rc.1 through 0.2.1-rc.2** — twenty-two
+  lines — works: each has had the full suite run against it with **every** dsh
+  package pinned to that single line (`tsc` clean). That matrix is not a table
   kept by hand: `npm run test:probe-lines` installs each line into its own tree
   and runs it, and `test/peer-lines.mjs` is the record both it and the range test
   read.
+- The suite reports **134 tests** on the fifteen lines through `0.2.0-rc.2`, and
+  **133 passing plus one skipped** on each of the seven `0.2.1` lines. The skipped
+  arm is the one that holds this plugin's frozen stream-grammar transcription to
+  the *shipped* validator: upstream deleted that module on 2026-09-30
+  (`f028f25667`, "remove runtime invariant plugins"), so from `0.2.1-alpha.1` on
+  there is nothing to compare against and the arm says so by name instead of
+  passing quietly. Where the line still publishes it, the comparison runs and
+  passes.
 - **Every older prerelease gets a loud `ERESOLVE`** rather than a silent runtime
-  failure on a generation the guard was never exercised against. One published
-  line is in that group deliberately — `0.2.1-alpha.1`, where `dsh-llm` no longer
-  ships the stream-grammar invariant module our protocol-legality arm runs
-  against, so the suite would be testing less there without saying so. It is
-  measured, not skipped: the probe asserts that line still fails for that reason.
+  failure on a generation the guard was never exercised against. No published
+  line is in that group by choice any more: the one exclusion this README used to
+  document (`0.2.1-alpha.1`, made for the deleted invariant module) is exactly the
+  mistake 0.3.2 corrects — excluding a line does not stop users from running it,
+  it only stops the plugin from loading there.
 - The guard does **not** depend on the `agent/assistant-stream` event that
   arrived in 0.1.5-alpha.1. It wraps the older `llm/stream` waterfall, which
   every admitted line has — that is what makes the wide support possible.
 - The guard needs `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm`:
 
   ```
-  >=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1
+  >=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1 || >=0.2.1-alpha.1 <0.3.0-0
   ```
 
 ### Why the peer range looks like that
@@ -520,24 +529,26 @@ you have to avoid both:
 ">=0.1.2-rc.1 <0.2.0"
 
 // What we ship: one comparator per supported tuple line.
-">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1"
+">=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1 || >=0.2.1-alpha.1 <0.3.0-0"
 ```
 
-Several generations are in active use at once — as of this release `@deepseek-ai/dsh`
-tags `latest` and `next` at `0.2.0-rc.2` and `alpha` at `0.2.1-alpha.1`, while the
-individual packages carry staler `latest` tags of their own (`dsh-agent` still
-says `0.1.0-rc.6`) — so one comparator per live tuple is needed. v0.1.1 shipped
+Several generations are in active use at once — as of this release the `0.2.1`
+line is published up to `0.2.1-rc.2` and has not reached a stable `0.2.1` yet,
+while the individual packages carry staler `latest` tags of their own (`dsh-agent`
+still says `0.1.0-rc.6`) — so one comparator per live tuple is needed. The newest
+comparator ends at `<0.3.0-0` rather than at a fixed patch: `0.3.0-0` is the
+lowest possible `0.3.0` prerelease, so every `0.2.1` build is admitted while the
+next minor line still has to earn its place by being measured. v0.1.1 shipped
 the first form and could not be installed at all (`ETARGET`); v0.1.2 shipped the
 second and rejected the `0.1.5` line (`ERESOLVE`); v0.1.6 shipped a union that had
 simply gone stale — it refused the `0.1.3-alpha.2` line and the whole `0.1.6`
 line, newest release included, for a plugin whose suite passes on both.
 
 The range deliberately admits **only** the lines this plugin is tested on: the
-fifteen listed in `test/peer-lines.mjs`, and nothing else among the published
-versions. Everything older (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`) and the
-one line excluded on measurement (`0.2.1-alpha.1`) gets a loud `ERESOLVE` rather
-than a silent runtime failure on a generation the guard has never been exercised
-against. Add a comparator for your line only after running the suite against it —
+twenty-two listed in `test/peer-lines.mjs`, and nothing else among the published
+versions. Everything older (`0.1.0-rc.*`, `0.1.1-rc.*`, `0.1.2-alpha.*`) gets a
+loud `ERESOLVE` rather than a silent runtime failure on a generation the guard has
+never been exercised against. Add a comparator for your line only after running the suite against it —
 `test/peer-range.spec.mjs` computes this set with `semver` and fails if the range
 and the tested set drift apart in either direction, and
 `npm run test:probe-lines` is what produces that set in the first place.

@@ -29,6 +29,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
+import { grammarSource, installGrammar } from './grammar.mjs'
+
+/** Which grammar this dsh line can offer; read once, named in the arm below. */
+const REGIME = await grammarSource()
 import { ReasoningRepetitionDetector, SentenceUnitCounter } from '../lib/index.js'
 
 /** Both reasoning rules on, at their shipped defaults; the visible rules off. */
@@ -342,11 +346,13 @@ test('the trailing answer is dropped, not flushed', async () => {
   assert.equal(out.filter(c => c.type === 'finish').length, 1)
 })
 
-test('the density cut is protocol-legal with a reasoning block still open', async () => {
+test(`the density cut is protocol-legal with a reasoning block still open (${REGIME} grammar)`, async () => {
   // The sibling rule's test covers the same wrapper; this one runs the DENSITY
-  // path through the shipped validator, because a rule is only shipped if the
-  // branch it exits through is legal.
-  const { apply } = await import('@deepseek-ai/dsh-llm/invariant')
+  // path through the grammar, because a rule is only shipped if the branch it
+  // exits through is legal. The regime is in the title: from `0.2.1-alpha.1` on
+  // upstream ships no validator, so a green there is `test/grammar.mjs`'s
+  // transcription agreeing — kept honest against the module wherever it exists
+  // by `test/grammar.spec.mjs`.
   const listeners = []
   const ctx = {
     on(name, listener, options) {
@@ -359,10 +365,9 @@ test('the density cut is protocol-legal with a reasoning block still open', asyn
     get: () => undefined,
   }
   const failures = []
-  const inner = new Proxy(ctx, { get: (t, k) => (k === 'on' ? t.on.bind(t) : t[k]) })
-  await apply({ ...inner, invariants: { register: (_n, installer) => installer(inner, m => failures.push(m)) } }, m => failures.push(m))
+  await installGrammar(ctx, m => failures.push(m))
   plugin.apply(ctx, CONFIG)
-  assert.equal(listeners.length, 2, 'the chain must be invariant -> plugin')
+  assert.equal(listeners.length, 2, 'the chain must be grammar -> plugin')
 
   const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
   async function* source() {

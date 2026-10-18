@@ -26,6 +26,10 @@ import assert from 'node:assert/strict'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
 import { ReasoningRepetitionDetector, trailingCycle, trailingReasoningCycle } from '../lib/index.js'
+import { grammarSource, installGrammar } from './grammar.mjs'
+
+/** Which grammar this dsh line can offer; read once, named in the arm below. */
+const REGIME = await grammarSource()
 
 /** The visible-output rules are off here: every assertion below is about reasoning. */
 const CONFIG = {
@@ -367,14 +371,8 @@ function chainContext(agent) {
 
 /** Install the shipped dsh-llm invariant, returning the failures it records. */
 async function installInvariant(context) {
-  const { apply } = await import('@deepseek-ai/dsh-llm/invariant')
   const failures = []
-  const fail = m => failures.push(m)
-  const inner = new Proxy(context, { get: (t, k) => (k === 'on' ? t.on.bind(t) : t[k]) })
-  await apply(
-    { ...inner, invariants: { register: (_name, installer) => installer(inner, fail) } },
-    fail,
-  )
+  await installGrammar(context, m => failures.push(m))
   return failures
 }
 
@@ -388,17 +386,17 @@ async function runChain(listeners, options, source) {
   return out
 }
 
-test('the reasoning cut is protocol-legal with a reasoning block still open', async () => {
+test(`the reasoning cut is protocol-legal with a reasoning block still open (${REGIME} grammar)`, async () => {
   // The output breaker fires with a text block open; the reasoning breaker fires
   // with a REASONING block open, which is a different position in the grammar.
   // `interruptedBlocks()` says it is allowed; this runs the wrapper's actual
-  // output through the shipped validator instead of trusting that reading — and
+  // output through the grammar instead of trusting that reading — and
   // the fixture deliberately never emits `reasoning-end`, exactly like a call
   // whose stream never finished.
   const { ctx, listeners } = chainContext(fakeAgent())
   const failures = await installInvariant(ctx)
   plugin.apply(ctx, CONFIG)
-  assert.equal(listeners.length, 2, 'the chain must be invariant -> plugin')
+  assert.equal(listeners.length, 2, 'the chain must be grammar -> plugin')
 
   const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
   const seen = await runChain(listeners, options, () => reasoningStream(4000, '好。', false))
