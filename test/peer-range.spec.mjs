@@ -118,6 +118,31 @@ test('the upper bound is a minor line, not a release (issue #3)', () => {
   assert.equal(Object.hasOwn(pkg, 'engines'), false, 'engines.dsh alone decides and would widen the support claim')
 })
 
+test('the range admits the same set under the reading the bundle gate uses', () => {
+  // Two consumers read this one string and they do not read it alike:
+  // `unmetRequirements()` calls `satisfies(..., { includePrerelease: true })`
+  // (`packages/boot/app-boot/src/plugin-compatibility.ts:52`), while npm's
+  // resolver uses the default reading — which refuses a prerelease unless some
+  // comparator in the same `major.minor.patch` tuple carries a tag of its own.
+  // The assertion above answers "can npm install it"; this one answers "will
+  // dsh load it", and a range that passes only one of them is a range that is
+  // broken for half its users.
+  //
+  // Measured on the form this release first considered — widening the last
+  // segment to `>=0.2.0-rc.1 <0.3.0-0` — 15 of these 22 lines are admitted by
+  // default and all 22 under the flag, because `0.2.1-alpha.1` finds no
+  // comparator of its own tuple. That range would have been right for the gate
+  // and an `ERESOLVE` for the installer.
+  for (const dep of PEER_DEPS) {
+    const range = pkg.peerDependencies[dep]
+    assert.deepEqual(
+      PUBLISHED.filter((v) => satisfies(v, range, { includePrerelease: true })),
+      SUPPORTED,
+      `the range "${range}" admits a different set with includePrerelease than without`,
+    )
+  }
+})
+
 test('the dev pins stay on a line the range admits', () => {
   // A dev pin outside the peer range would mean the suite ran against a line the
   // published package refuses — the exact mismatch this file exists to prevent.
