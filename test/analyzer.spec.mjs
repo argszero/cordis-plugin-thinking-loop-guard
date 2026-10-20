@@ -536,3 +536,119 @@ test('an unreadable file says so instead of presenting an empty verdict', () => 
   assert.match(out, /check the skipped-type inventory above/)
   assert.match(out, /skipped by type: reasoning-chunks 1, text-chunks 1/)
 })
+
+test('analyzer reads v2 assistant/message events, the success path', () => {
+  // Format v2 (f99b06eaed) splits one model call across two events: a call that
+  // committed a surface message writes assistant/message, and only a call that
+  // committed NO surface message writes assistant/attempt. Reading attempts
+  // alone read the failures and none of the successful calls.
+  const message = (turn, step, stream) => ({
+    type: 'assistant/message', seq: 0, time: 0,
+    data: { turn, step, message: { id: `m${turn}`, role: 'assistant', content: [] }, stream },
+  })
+  const file = writeSession([
+    message(0, 0, [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }]),
+    message(0, 1, [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+      { type: 'text-chunks', time0: 1, texts: [[1, 'still thinking']] },
+    ]),
+  ])
+  const { steps, coverage } = run(file)
+  assert.equal(steps.length, 2, 'a session of successful calls is readable')
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[0].reasoningChars, STALLED.length, 'reasoning is read, not zero')
+  assert.equal(steps[1].verdict, 'repeated-material')
+  assert.equal(coverage.parsed, 2)
+  assert.deepEqual(coverage.parsedByEventType, { 'assistant/message': 2 })
+  assert.equal(coverage.skipped, 0, 'no longer a skipped type')
+})
+
+test('analyzer falls back to message.content when the stream omits a channel', () => {
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [
+        { type: 'reasoning', text: STALLED },
+        { type: 'text', text: 'still thinking' },
+      ] },
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].reasoningChars, STALLED.length)
+  assert.equal(steps[0].hasOutput, true)
+  assert.equal(steps[0].textChars, 'still thinking'.length)
+})
+
+test('a message carrying both a stream and blocks counts each channel once', () => {
+  // The blocks are the assembled form of the same deltas. Adding them to the
+  // stream would inflate exactly the number the reporter is trying to trust.
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [
+        { type: 'reasoning', text: STALLED },
+        { type: 'text', text: 'still thinking' },
+      ] },
+      stream: [
+        { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+        { type: 'text-chunks', time0: 1, texts: [[1, 'still thinking']] },
+      ],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].reasoningChars, STALLED.length, 'stream reasoning, not doubled')
+  assert.equal(steps[0].textChars, 'still thinking'.length, 'stream text, not doubled')
+})
+
+test('block-start, block-end, usage and finish are known chunk kinds, not unknown', () => {
+  // A v2 file was reporting these as unrecognised stream content, which reads
+  // as format drift when it is the writer's normal framing.
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [] },
+      stream: [
+        { type: 'chunk', time: 0, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } },
+        { type: 'reasoning-chunks', time0: 1, texts: [[1, STALLED]] },
+        { type: 'chunk', time: 2, chunk: { type: 'block-end', index: 0, block: { type: 'reasoning', text: STALLED } } },
+        { type: 'chunk', time: 3, chunk: { type: 'usage', usage: { inputTokens: 1, outputTokens: 2 } } },
+        { type: 'chunk', time: 4, chunk: { type: 'finish', reason: { kind: 'stop' } } },
+      ],
+    } },
+  ])
+  const { steps, coverage } = run(file)
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].reasoningChars, STALLED.length, 'block-end does not re-add the block')
+  assert.deepEqual(coverage.unknownChunkTypes ?? {}, {}, 'none counted as unknown')
+  assert.ok(!runText(file).includes('⚠'), 'no stream-content warning')
+})
+
+test('a half-populated stream takes only the channel it is missing from the blocks', () => {
+  // The all-stream case above cannot see the per-channel guard: when both
+  // channels arrive as deltas the message is returned whole. Here the stream
+  // carries one channel only, so the block fallback runs — and it must add the
+  // missing channel while still skipping the one the stream already delivered.
+  const message = (turn, step, stream) => ({
+    type: 'assistant/message', seq: 0, time: 0, data: {
+      turn, step,
+      message: { id: `m${turn}`, role: 'assistant', content: [
+        { type: 'reasoning', text: STALLED },
+        { type: 'text', text: 'still thinking' },
+      ] },
+      stream,
+    },
+  })
+  const file = writeSession([
+    // reasoning in the stream, text only in the blocks
+    message(0, 0, [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }]),
+    // text in the stream, reasoning only in the blocks
+    message(0, 1, [{ type: 'text-chunks', time0: 1, texts: [[1, 'still thinking']] }]),
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 2)
+  assert.equal(steps[0].reasoningChars, STALLED.length, 'reasoning delivered once, not twice')
+  assert.equal(steps[0].textChars, 'still thinking'.length, 'text taken from the blocks')
+  assert.equal(steps[1].reasoningChars, STALLED.length, 'reasoning taken from the blocks')
+  assert.equal(steps[1].textChars, 'still thinking'.length, 'text delivered once, not twice')
+})

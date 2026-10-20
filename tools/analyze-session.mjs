@@ -15,11 +15,22 @@
  *   node tools/analyze-session.mjs <session.jsonl> [--similarity 0.8] [--threshold 3]
  *                                [--min-chars 2048] [--max-fires 4] [--json]
  *
- * Reads both durable attempt formats:
+ * Reads all three durable attempt formats:
  *   - `assistant/chunk` (session format v1: dsh <= 0.1.2-rc.1) — one event per
  *     stream chunk, grouped by (turn, step);
- *   - `assistant/attempt` (session format v2: dsh >= 0.1.5) — one event per
- *     attempt carrying the whole compacted `stream` record array.
+ *   - `assistant/message` (session format v2: dsh >= 0.1.3-alpha.1) — one event
+ *     per model call that **committed a surface message**, carrying the whole
+ *     compacted `stream` record array plus the assembled `message.content`;
+ *   - `assistant/attempt` (session format v2) — one event per model call that
+ *     committed **no** surface message, i.e. a failed, retried, cancelled or
+ *     stream-error attempt.
+ *
+ * The last two are one split, not two formats: `f99b06eaed` ("embed assistant
+ * streams in format v2") introduced both, and a call lands in exactly one of
+ * them. Reading attempts alone therefore saw failures only — on a session whose
+ * calls all succeeded it read no steps at all, and on the reporter's
+ * 0.2.1-rc.2 session it read the 62 retried attempts and skipped the 558
+ * `assistant/message` lines carrying every successful call.
  *
  * A "step" is one model call, i.e. one (turn, step) group. For each step it
  * reports whether text/tool output was emitted and what the reasoning was, then
@@ -144,6 +155,17 @@ function isOutputChunk(type) {
   return type === 'text-delta' || type === 'tool-call-delta'
 }
 
+/**
+ * Chunk kinds that are expected, carry no text of their own, and are therefore
+ * NOT unrecognised.
+ *
+ * `block-start`/`block-end` announce an assembled block the stream already
+ * delivered delta by delta (reading the block as well would double-count it),
+ * `usage` is accounting, and `finish` is the terminator. Counting them as
+ * unknown made a healthy v2 file look like a format the tool had lost track of.
+ */
+const TEXT_FREE_CHUNK_TYPES = new Set(['block-start', 'block-end', 'usage', 'finish'])
+
 /** Pull the reasoning/text/tool deltas out of one raw chunk. */
 function readChunk(chunk, coverage) {
   if (chunk === null || typeof chunk !== 'object') return undefined
@@ -152,6 +174,7 @@ function readChunk(chunk, coverage) {
   if (type === 'reasoning-delta') return { type, text: String(chunk.text ?? '') }
   if (type === 'text-delta') return { type, text: String(chunk.text ?? '') }
   if (type === 'tool-call-delta') return { type, text: String(chunk.argumentsDelta ?? '') }
+  if (TEXT_FREE_CHUNK_TYPES.has(type)) return { type, text: '' }
   // Unknown chunk kinds carry no text this tool can use, but they still use up a
   // position in the call, so they are counted instead of vanishing.
   bump(coverage.unknownChunkTypes, type)
@@ -171,22 +194,62 @@ function deltasFromChunkEvent(event, coverage) {
 }
 
 /**
- * Flatten one v2 `assistant/attempt` event's compacted stream into deltas.
+ * Flatten one v2 `assistant/attempt` event into deltas.
  *
- * The durable stream is a compacted record array, not raw chunks:
- *   - `{ type: 'chunk', time, chunk }` — one chunk, unchanged;
- *   - `{ type: 'text-chunks' | 'reasoning-chunks', texts: string[] }` and
- *     `{ type: 'tool-call-chunks', args: string[] }` — run-length-compacted
- *     delta groups. The tool-call group is the one that changed key: 0.1.5/0.1.6
- *     wrote `texts` for it, current master writes `args`, so both are read.
- *     Missing the newer key dropped every tool-argument delta, which flipped
- *     `hasOutput` on a call whose only output was a tool call.
- * Unknown record types are ignored rather than guessed at, so a future format
- * addition degrades to "fewer steps observed" instead of a wrong verdict — and
- * `coverage.unknownRecordTypes` says how many were ignored.
+ * An attempt is the other half of format v2's split: a model call that
+ * committed no surface message. It carries the same compacted `stream` array as
+ * `assistant/message`, so the reader is shared. The record walk it documents —
+ * packed `text-chunks`/`reasoning-chunks`/`tool-call-chunks` runs beside raw
+ * `chunk` records, `texts` on 0.1.5/0.1.6 and `args` on current master for the
+ * tool-call group, and unknown record types counted rather than guessed at —
+ * lives in {@link deltasFromStreamRecords}.
  */
 function deltasFromAttemptEvent(event, coverage) {
-  const stream = event?.data?.stream
+  return deltasFromStreamRecords(event?.data?.stream, coverage)
+}
+
+/**
+ * Flatten one v2+ `assistant/message` event into deltas.
+ *
+ * Format v2 put one model call in exactly one of two events, and this is the
+ * success path: a call that committed a surface message embeds the same
+ * compacted `stream` the attempt event carries (`core/session/src/types.ts`,
+ * `assistant/message`), so the stream reader above applies unchanged.
+ *
+ * The assembled `message.content` blocks are the fallback, never an addition:
+ * a block set is the *assembled* form of deltas the stream already carries, so
+ * reading both would double-count every character and inflate exactly the
+ * `reasonChars` the reporter is trying to trust. One channel, one source — the
+ * stream wins for each channel it covers, and a block fills only a channel the
+ * stream left empty. That is what makes `reasonChars 0` mean "no reasoning"
+ * again instead of "read from the wrong field".
+ */
+function deltasFromMessageEvent(event, coverage) {
+  const fromStream = deltasFromStreamRecords(event?.data?.stream, coverage)
+  const streamHasReasoning = fromStream.some(delta => delta.type === 'reasoning-delta')
+  const streamHasOutput = fromStream.some(delta => isOutputChunk(delta.type))
+  const blocks = event?.data?.message?.content
+  if (streamHasReasoning && streamHasOutput) return fromStream
+  if (!Array.isArray(blocks)) return fromStream
+  const fromBlocks = []
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue
+    if (block.type === 'reasoning' && !streamHasReasoning) {
+      fromBlocks.push({ type: 'reasoning-delta', text: String(block.text ?? '') })
+    } else if (block.type === 'text' && !streamHasOutput) {
+      fromBlocks.push({ type: 'text-delta', text: String(block.text ?? '') })
+    }
+  }
+  return fromBlocks.length === 0 ? fromStream : [...fromStream, ...fromBlocks]
+}
+
+/**
+ * Walk one compacted `stream` record array and flatten it into deltas.
+ *
+ * Shared by `assistant/attempt` and `assistant/message`, which carry the same
+ * record array; only the event that wraps it differs.
+ */
+function deltasFromStreamRecords(stream, coverage) {
   if (!Array.isArray(stream)) return []
   const out = []
   for (const record of stream) {
@@ -223,6 +286,20 @@ function deltasFromAttemptEvent(event, coverage) {
   return out
 }
 
+/**
+ * The event types that describe one model call, and the reader for each.
+ *
+ * `assistant/message` is not an addition to this list's second entry but its
+ * other half — a call commits a message OR an attempt, never both — so a
+ * reader that knows only one of them reads only the failures.
+ */
+const STEP_DELTA_READERS = {
+  'assistant/chunk': deltasFromChunkEvent,
+  'assistant/message': deltasFromMessageEvent,
+  'assistant/attempt': deltasFromAttemptEvent,
+}
+const STEP_EVENT_TYPES = new Set(Object.keys(STEP_DELTA_READERS))
+
 /** Group the file's events into per-model-call steps, in file order. */
 function readSteps(lines, coverage) {
   const steps = []
@@ -232,7 +309,7 @@ function readSteps(lines, coverage) {
     let event
     try { event = JSON.parse(line) } catch { coverage.unparsable += 1; continue }
     const type = event?.type
-    if (type !== 'assistant/chunk' && type !== 'assistant/attempt') {
+    if (!STEP_EVENT_TYPES.has(type)) {
       // Skipped by design — but disclosed, because "skipped" and "absent" look
       // identical from the summary line alone.
       if (typeof type === 'string') bump(coverage.skippedTypes, type)
@@ -241,7 +318,8 @@ function readSteps(lines, coverage) {
     }
     coverage.parsed += 1
     bump(coverage.eventTypes, type)
-    // v1 chunk events carry (turn, step) in data; v2 attempts are already one step.
+    // Every step event carries (turn, step) in data: v1 chunk events annotate
+    // each chunk with them, and both v2 events are already one model call.
     const turn = event?.data?.turn
     const step = event?.data?.step
     const key = `${turn}/${step}`
@@ -251,7 +329,7 @@ function readSteps(lines, coverage) {
       byCoordinate.set(key, group)
       steps.push(group)
     }
-    const deltas = type === 'assistant/chunk' ? deltasFromChunkEvent(event, coverage) : deltasFromAttemptEvent(event, coverage)
+    const deltas = STEP_DELTA_READERS[type](event, coverage)
     for (const delta of deltas) {
       if (delta.type === 'reasoning-delta') {
         group.reasoning += delta.text
