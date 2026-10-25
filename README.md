@@ -306,6 +306,12 @@ that), so its repetition rules stay the two exact-period ones.
 
 ## Install
 
+```sh
+dsh plugin --profile <profile> add github:argszero/cordis-plugin-thinking-loop-guard
+```
+
+The git spec installs the tree this README describes; `npm install` on its own never attaches a plugin to a profile — `dsh plugin add` is what writes the row that makes it load.
+
 Load it as an `@deepseek-ai/cordis` plugin in your `dsh` profile, or mount the
 bundle patch:
 
